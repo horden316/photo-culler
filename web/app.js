@@ -322,6 +322,42 @@ async function mark(id, status) {
   });
 }
 
+function syncViewerStatus(photo) {
+  viewerMeta.textContent = `sharp ${formatScore(photo.blurScore)} · ${photo.rawPath ? "RAW paired" : "no RAW"}`;
+  document.querySelectorAll("[data-mark]").forEach((button) => {
+    const isSelected = button.dataset.mark === photo.status;
+    button.classList.toggle("selected", isSelected);
+    button.setAttribute("aria-pressed", String(isSelected));
+  });
+}
+
+function replacePhotoCard(photo) {
+  const card = grid.querySelector(`.card[data-id="${photo.id}"]`);
+  if (!card) return;
+  const index = state.photos.findIndex((item) => item.id === photo.id);
+  if (index < 0) return;
+  card.replaceWith(renderCard(photo, index));
+}
+
+function updatePhotoInState(photo) {
+  const index = state.photos.findIndex((item) => item.id === photo.id);
+  if (index >= 0) {
+    Object.assign(state.photos[index], photo);
+    state.selected = state.photos[index];
+    replacePhotoCard(state.photos[index]);
+    return state.photos[index];
+  }
+  state.selected = photo;
+  return photo;
+}
+
+async function markSelectedPhoto(status) {
+  if (!state.selected) return;
+  const updated = await mark(state.selected.id, status);
+  const photo = updatePhotoInState(updated);
+  syncViewerStatus(photo);
+}
+
 function updateViewerNavButtons() {
   // Navigation is keyboard-only for now; keep this hook for future UI state.
 }
@@ -330,7 +366,7 @@ function showViewerPhoto(photo, index) {
   state.selected = photo;
   state.selectedIndex = index;
   viewerName.textContent = `${photo.filename} · ${index + 1}/${state.photoCount || state.photos.length}`;
-  viewerMeta.textContent = `sharp ${formatScore(photo.blurScore)} · ${photo.rawPath ? "RAW paired" : "no RAW"}`;
+  syncViewerStatus(photo);
   viewerExposure.textContent = formatExposureInfo(photo.metadata);
   updateViewerNavButtons();
   loadViewerImage(photo);
@@ -461,16 +497,16 @@ grid.addEventListener("click", async (event) => {
   if (!photo) return;
   const updated = await mark(photo.id, button.dataset.status);
   Object.assign(photo, updated);
-  const index = state.photos.findIndex((item) => item.id === photo.id);
-  card.replaceWith(renderCard(photo, index));
+  replacePhotoCard(photo);
+  if (state.selected?.id === photo.id) {
+    state.selected = photo;
+    syncViewerStatus(photo);
+  }
 });
 
 document.querySelectorAll("[data-mark]").forEach((button) => {
   button.addEventListener("click", async () => {
-    if (!state.selected) return;
-    state.selected = await mark(state.selected.id, button.dataset.mark);
-    viewer.close();
-    await loadPhotos({ reset: true });
+    await markSelectedPhoto(button.dataset.mark);
   });
 });
 
@@ -615,9 +651,8 @@ document.addEventListener("keydown", async (event) => {
   }
   const keyMap = { "1": "keep", "2": "review", "3": "reject" };
   if (!keyMap[event.key]) return;
-  state.selected = await mark(state.selected.id, keyMap[event.key]);
-  viewer.close();
-  await loadPhotos({ reset: true });
+  event.preventDefault();
+  await markSelectedPhoto(keyMap[event.key]);
 });
 
 async function init() {

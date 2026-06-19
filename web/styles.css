@@ -306,6 +306,35 @@ dialog::backdrop {
   flex: 0 0 auto;
 }
 
+.viewerActions [data-mark].selected {
+  border-color: #202124;
+  color: #ffffff;
+}
+
+.viewerActions [data-mark="keep"].selected {
+  background: #226d58;
+}
+
+.viewerActions [data-mark="keep"].selected:hover {
+  background: #226d58;
+}
+
+.viewerActions [data-mark="review"].selected {
+  background: #805d18;
+}
+
+.viewerActions [data-mark="review"].selected:hover {
+  background: #805d18;
+}
+
+.viewerActions [data-mark="reject"].selected {
+  background: #b24a3c;
+}
+
+.viewerActions [data-mark="reject"].selected:hover {
+  background: #b24a3c;
+}
+
 @media (max-width: 720px) {
   .topbar,
   .viewerInfo {
