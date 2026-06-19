@@ -472,13 +472,15 @@ async function navigateViewer(delta) {
 
 async function pollScan() {
   scanBtn.disabled = true;
+  scanControlBtn.hidden = false;
   while (true) {
     const job = await api("/api/scan-status");
     const total = job.total || 0;
     const done = job.done || 0;
     const percent = total ? Math.round((done / total) * 100) : 0;
+    scanControlBtn.textContent = job.paused ? "Continue" : "Stop";
     summary.textContent = job.running
-      ? `${job.message} · ${done} / ${total} · ${percent}%`
+      ? `${job.paused ? "Paused" : job.message} · ${done} / ${total} · ${percent}%`
       : job.error
         ? `Scan failed: ${job.error}`
         : job.result
@@ -488,6 +490,7 @@ async function pollScan() {
     await new Promise((resolve) => setTimeout(resolve, 1000));
   }
   scanBtn.disabled = false;
+  scanControlBtn.hidden = true;
   await loadPhotos({ reset: true });
 }
 
@@ -497,6 +500,11 @@ scanBtn.addEventListener("click", async () => {
   await pollScan();
 });
 
+scanControlBtn.addEventListener("click", async () => {
+  const paused = scanControlBtn.textContent !== "Continue";
+  await api("/api/scan-control", { method: "POST", body: JSON.stringify({ paused }) });
+  scanControlBtn.textContent = paused ? "Continue" : "Stop";
+});
 
 chooseFolderBtn.addEventListener("click", async () => {
   await loadFolder(state.library);

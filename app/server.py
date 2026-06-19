@@ -12,7 +12,7 @@ import sys
 import threading
 import time
 import mimetypes
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -46,6 +46,7 @@ MIME_TYPES = {
 }
 SCAN_JOB = {
     "running": False,
+    "paused": False,
     "done": 0,
     "total": 0,
     "message": "Idle",
@@ -101,12 +102,35 @@ def connect() -> sqlite3.Connection:
         )
         """
     )
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS photo_marks (
+            id TEXT PRIMARY KEY,
+            path TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )
+        """
+    )
     try:
         db.execute("ALTER TABLE photos ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'")
     except sqlite3.OperationalError:
         pass
+    db.execute(
+        """
+        INSERT INTO photo_marks (id, path, status, updated_at)
+        SELECT id, path, status, updated_at
+        FROM photos
+        WHERE status != 'unmarked'
+        ON CONFLICT(id) DO UPDATE SET
+            path=excluded.path,
+            status=excluded.status,
+            updated_at=excluded.updated_at
+        """
+    )
     db.execute("CREATE INDEX IF NOT EXISTS idx_photos_status ON photos(status)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_photos_stem ON photos(stem)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_photo_marks_path ON photo_marks(path)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_orphan_raws_stem ON orphan_raws(stem)")
     db.commit()
     return db
@@ -178,19 +202,17 @@ def list_directory(path: Path | None = None) -> dict:
 def scan_files(library: Path):
     display_files: list[Path] = []
     raw_by_key: dict[tuple[str, str], Path] = {}
-    for dirpath, dirnames, filenames in os.walk(library):
-        current = Path(dirpath)
-        dirnames[:] = [name for name in dirnames if name not in SKIP_DIRS and not name.startswith(".")]
-        if should_skip(current.relative_to(library)):
+    for path in library.iterdir():
+        if path.name.startswith(".") or path.name in SKIP_DIRS:
             continue
-        for filename in filenames:
-            path = current / filename
-            ext = path.suffix.lower()
-            key = (str(current), path.stem.lower())
-            if ext in DISPLAY_EXTS:
-                display_files.append(path)
-            elif ext in RAW_EXTS:
-                raw_by_key[key] = path
+        if not path.is_file():
+            continue
+        ext = path.suffix.lower()
+        key = (str(library), path.stem.lower())
+        if ext in DISPLAY_EXTS:
+            display_files.append(path)
+        elif ext in RAW_EXTS:
+            raw_by_key[key] = path
     return display_files, raw_by_key
 
 
@@ -228,6 +250,22 @@ def full_path_for(pid: str) -> Path:
 
 def preview_path_for(pid: str) -> Path:
     return PREVIEW_ROOT / f"{pid}.jpg"
+
+
+def prune_cache(keep_ids: set[str]) -> int:
+    removed = 0
+    for cache_root in (THUMB_ROOT, FULL_ROOT, PREVIEW_ROOT):
+        cache_root.mkdir(parents=True, exist_ok=True)
+        for path in cache_root.iterdir():
+            if not path.is_file():
+                continue
+            if path.suffix.lower() != ".jpg" or path.stem not in keep_ids:
+                try:
+                    path.unlink()
+                    removed += 1
+                except OSError:
+                    pass
+    return removed
 
 
 def ensure_thumbnail(path: Path, pid: str) -> Path | None:
@@ -435,54 +473,97 @@ def update_scan_job(**updates):
         SCAN_JOB.update(updates)
 
 
-def scan_library(library: Path) -> dict:
+def wait_for_scan_resume():
+    while True:
+        with SCAN_LOCK:
+            paused = SCAN_JOB["paused"]
+            running = SCAN_JOB["running"]
+        if not running or not paused:
+            return
+        time.sleep(0.2)
+
+
+def scan_library(library: Path, workers: int = DEFAULT_WORKERS) -> dict:
     if not library.exists() or not library.is_dir():
         raise ValueError(f"Library folder does not exist: {library}")
     display_files, raw_by_key = scan_files(library)
+    keep_cache_ids = {photo_id(path) for path in display_files}
     display_keys = {(str(path.parent), path.stem.lower()) for path in display_files}
     orphan_raws = [path for key, path in raw_by_key.items() if key not in display_keys]
     db = connect()
+    db.execute("DELETE FROM photos WHERE path NOT LIKE ?", (f"{str(library)}{os.sep}%",))
+    db.execute("DELETE FROM photos WHERE directory != ?", (str(library),))
+    db.execute("DELETE FROM orphan_raws")
+    db.commit()
+    removed_cache = prune_cache(keep_cache_ids)
     started = time.time()
-    update_scan_job(running=True, done=0, total=len(display_files), message="Generating thumbnails")
+    update_scan_job(
+        running=True,
+        paused=False,
+        done=0,
+        total=len(display_files),
+        message=f"Cleared {removed_cache} stale cache files" if removed_cache else "Generating thumbnails",
+    )
     futures = {}
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        for path in display_files:
+    worker_count = max(1, workers)
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        paths = iter(display_files)
+
+        def submit_next() -> bool:
+            try:
+                path = next(paths)
+            except StopIteration:
+                return False
             key = (str(path.parent), path.stem.lower())
             futures[executor.submit(process_photo, path, raw_by_key.get(key))] = path
+            return True
 
-        for index, future in enumerate(as_completed(futures), start=1):
-            item = future.result()
-            db.execute(
-                """
-                INSERT INTO photos (
-                    id, path, directory, stem, ext, raw_path, width, height,
-                    created_at, blur_score, metadata_json, warnings, updated_at
+        for _ in range(worker_count):
+            if not submit_next():
+                break
+
+        index = 0
+        while futures:
+            done_futures, _ = wait(futures, return_when=FIRST_COMPLETED)
+            for future in done_futures:
+                futures.pop(future, None)
+                wait_for_scan_resume()
+                index += 1
+                item = future.result()
+                item["status"] = saved_status(db, item["id"], item["path"])
+                db.execute(
+                    """
+                    INSERT INTO photos (
+                        id, path, directory, stem, ext, raw_path, width, height,
+                        created_at, blur_score, metadata_json, status, warnings, updated_at
+                    )
+                    VALUES (
+                        :id, :path, :directory, :stem, :ext, :raw_path, :width, :height,
+                        :created_at, :blur_score, :metadata_json, :status, :warnings, :updated_at
+                    )
+                    ON CONFLICT(id) DO UPDATE SET
+                        path=excluded.path,
+                        directory=excluded.directory,
+                        stem=excluded.stem,
+                        ext=excluded.ext,
+                        raw_path=excluded.raw_path,
+                        width=excluded.width,
+                        height=excluded.height,
+                        created_at=excluded.created_at,
+                        blur_score=excluded.blur_score,
+                        metadata_json=excluded.metadata_json,
+                        status=excluded.status,
+                        warnings=excluded.warnings,
+                        updated_at=excluded.updated_at
+                    """,
+                    item,
                 )
-                VALUES (
-                    :id, :path, :directory, :stem, :ext, :raw_path, :width, :height,
-                    :created_at, :blur_score, :metadata_json, :warnings, :updated_at
-                )
-                ON CONFLICT(id) DO UPDATE SET
-                    path=excluded.path,
-                    directory=excluded.directory,
-                    stem=excluded.stem,
-                    ext=excluded.ext,
-                    raw_path=excluded.raw_path,
-                    width=excluded.width,
-                    height=excluded.height,
-                    created_at=excluded.created_at,
-                    blur_score=excluded.blur_score,
-                    metadata_json=excluded.metadata_json,
-                    warnings=excluded.warnings,
-                    updated_at=excluded.updated_at
-                """,
-                item,
-            )
-            if index % 25 == 0:
-                db.commit()
-                update_scan_job(done=index, message=f"Processed {index} / {len(display_files)}")
+                if index % 25 == 0:
+                    db.commit()
+                    update_scan_job(done=index, message="Processing")
+                wait_for_scan_resume()
+                submit_next()
     db.commit()
-    db.execute("DELETE FROM orphan_raws")
     for raw_path in orphan_raws:
         stat = raw_path.stat()
         db.execute(
@@ -526,17 +607,18 @@ def scan_library(library: Path) -> dict:
         "orphanRaws": orphan_count,
         "seconds": round(time.time() - started, 2),
     }
-    update_scan_job(running=False, result=result, message="Complete")
+    update_scan_job(running=False, paused=False, result=result, message="Complete")
     return result
 
 
-def start_scan(library: Path) -> dict:
+def start_scan(library: Path, workers: int = DEFAULT_WORKERS) -> dict:
     with SCAN_LOCK:
         if SCAN_JOB["running"]:
             return {"started": False, "job": dict(SCAN_JOB)}
         SCAN_JOB.update(
             {
                 "running": True,
+                "paused": False,
                 "done": 0,
                 "total": 0,
                 "message": "Starting",
@@ -547,12 +629,30 @@ def start_scan(library: Path) -> dict:
 
     def runner():
         try:
-            scan_library(library)
+            scan_library(library, workers)
         except Exception as exc:
-            update_scan_job(running=False, error=str(exc), message="Failed")
+            update_scan_job(running=False, paused=False, error=str(exc), message="Failed")
 
     threading.Thread(target=runner, daemon=True).start()
     return {"started": True, "job": dict(SCAN_JOB)}
+
+
+def set_scan_paused(paused: bool) -> dict:
+    with SCAN_LOCK:
+        if not SCAN_JOB["running"]:
+            SCAN_JOB["paused"] = False
+            return {"paused": False, "job": dict(SCAN_JOB)}
+        SCAN_JOB["paused"] = paused
+        SCAN_JOB["message"] = "Paused" if paused else "Processing"
+        return {"paused": paused, "job": dict(SCAN_JOB)}
+
+
+def saved_status(db: sqlite3.Connection, pid: str, path: str) -> str:
+    row = db.execute(
+        "SELECT status FROM photo_marks WHERE id = ? OR path = ? ORDER BY updated_at DESC LIMIT 1",
+        (pid, path),
+    ).fetchone()
+    return row["status"] if row else "unmarked"
 
 
 def row_to_photo(row: sqlite3.Row) -> dict:
@@ -731,12 +831,29 @@ def mark_photo(pid: str, status: str) -> dict:
     if status not in {"unmarked", "keep", "review", "reject"}:
         raise ValueError("Invalid status")
     db = connect()
-    db.execute("UPDATE photos SET status = ?, updated_at = ? WHERE id = ?", (status, time.time(), pid))
+    row = db.execute("SELECT * FROM photos WHERE id = ?", (pid,)).fetchone()
+    if row is None:
+        db.close()
+        raise ValueError("Photo not found")
+    updated_at = time.time()
+    db.execute("UPDATE photos SET status = ?, updated_at = ? WHERE id = ?", (status, updated_at, pid))
+    if status == "unmarked":
+        db.execute("DELETE FROM photo_marks WHERE id = ? OR path = ?", (pid, row["path"]))
+    else:
+        db.execute(
+            """
+            INSERT INTO photo_marks (id, path, status, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                path=excluded.path,
+                status=excluded.status,
+                updated_at=excluded.updated_at
+            """,
+            (pid, row["path"], status, updated_at),
+        )
     db.commit()
     row = db.execute("SELECT * FROM photos WHERE id = ?", (pid,)).fetchone()
     db.close()
-    if row is None:
-        raise ValueError("Photo not found")
     return row_to_photo(row)
 
 
@@ -772,6 +889,7 @@ def move_rejected(library: Path) -> dict:
             moved_paths.append(str(dest))
         if moved_paths:
             db.execute("DELETE FROM photos WHERE id = ?", (pid,))
+            db.execute("DELETE FROM photo_marks WHERE id = ? OR path = ?", (pid, row["path"]))
             moved.append({"id": pid, "destinations": moved_paths})
     db.commit()
     db.close()
@@ -895,7 +1013,11 @@ class Handler(SimpleHTTPRequestHandler):
                 library = Path(payload.get("library") or self.library).expanduser().resolve()
                 self.__class__.library = library
                 self.__class__.library_selected = True
-                json_response(self, start_scan(library))
+                json_response(self, start_scan(library, self.workers))
+                return
+            if parsed.path == "/api/scan-control":
+                payload = read_json(self)
+                json_response(self, set_scan_paused(bool(payload.get("paused"))))
                 return
             if parsed.path.startswith("/api/photos/") and parsed.path.endswith("/mark"):
                 pid = parsed.path.split("/")[3]
@@ -918,14 +1040,17 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--library", default=None, help="Photo library folder")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="Concurrent photo processing workers")
     args = parser.parse_args(argv)
 
     Handler.library = Path(args.library).expanduser().resolve() if args.library else default_library().resolve()
     Handler.library_selected = args.library is not None
+    Handler.workers = max(1, args.workers)
     connect().close()
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"Photo Culler running at http://{args.host}:{args.port}")
     print(f"Library: {Handler.library}")
+    print(f"Workers: {Handler.workers}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
