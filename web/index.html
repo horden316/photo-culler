@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Photo Culler</title>
+    <link rel="stylesheet" href="/styles.css?v=nav2" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>Photo Culler</h1>
+        <p id="libraryPath"></p>
+      </div>
+      <div class="actions">
+        <button id="scanBtn">Scan</button>
+        <button id="moveOrphanBtn">Move Orphan RAWs</button>
+        <button id="moveBtn" class="danger">Move Rejects</button>
+      </div>
+    </header>
+
+    <nav class="filters">
+      <button data-status="" class="active">All</button>
+      <button data-status="unmarked">Unmarked</button>
+      <button data-status="keep">Keep</button>
+      <button data-status="review">Review</button>
+      <button data-status="reject">Reject</button>
+      <button data-warning="soft">Soft</button>
+      <button data-warning="no_raw_pair">No RAW</button>
+      <button data-view="orphan_raws">Orphan RAW</button>
+      <input id="search" placeholder="Search filename" />
+    </nav>
+
+    <main>
+      <section class="summary" id="summary"></section>
+      <section class="grid" id="grid"></section>
+      <button id="loadMore" class="load-more">Load more</button>
+    </main>
+
+    <dialog id="viewer">
+      <form method="dialog">
+        <button class="close">Close</button>
+      </form>
+      <div class="imageStage" id="imageStage">
+        <img id="viewerImg" alt="" />
+      </div>
+      <div class="viewerInfo">
+        <strong id="viewerName"></strong>
+        <span id="viewerSource" class="sourceBadge"></span>
+        <span id="viewerMeta"></span>
+        <span id="viewerExposure" class="exposureInfo"></span>
+        <div class="viewerActions">
+          <button id="zoomOut" type="button">-</button>
+          <button id="zoomFit" type="button">Fit</button>
+          <button id="zoomActual" type="button">100%</button>
+          <button id="zoomIn" type="button">+</button>
+          <button data-mark="keep">Keep</button>
+          <button data-mark="review">Review</button>
+          <button data-mark="reject" class="danger">Reject</button>
+        </div>
+      </div>
+    </dialog>
+
+    <script src="/app.js?v=nav2"></script>
+  </body>
+</html>

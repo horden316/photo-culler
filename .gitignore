@@ -1,0 +1,17 @@
+# Runtime/cache data
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Local environment
+.env
+.venv/
+venv/
+
+# Logs
+*.log
+
+# macOS
+.DS_Store

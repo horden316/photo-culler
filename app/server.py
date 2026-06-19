@@ -1,0 +1,881 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+import mimetypes
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from http import HTTPStatus
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
+
+try:
+    from PIL import Image, ImageFilter, ImageStat
+except Exception:  # pragma: no cover
+    Image = None
+    ImageFilter = None
+    ImageStat = None
+
+
+DISPLAY_EXTS = {".hif", ".heif", ".heic", ".jpg", ".jpeg"}
+RAW_EXTS = {".raf", ".arw", ".cr2", ".cr3", ".nef", ".dng", ".rw2", ".orf"}
+SKIP_DIRS = {"photo-culler", "_PHOTO_CULLER_REJECTED", "_PHOTO_CULLER_REVIEW", "_PHOTO_CULLER_ORPHAN_RAW"}
+ROOT = Path(__file__).resolve().parents[2]
+APP_ROOT = Path(__file__).resolve().parents[1]
+WEB_ROOT = APP_ROOT / "web"
+DATA_ROOT = APP_ROOT / "data"
+THUMB_ROOT = DATA_ROOT / "thumbs"
+FULL_ROOT = DATA_ROOT / "full"
+PREVIEW_ROOT = DATA_ROOT / "preview"
+DB_PATH = DATA_ROOT / "catalog.sqlite3"
+MIME_TYPES = {
+    ".hif": "image/heif",
+    ".heif": "image/heif",
+    ".heic": "image/heic",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+}
+SCAN_JOB = {
+    "running": False,
+    "done": 0,
+    "total": 0,
+    "message": "Idle",
+    "result": None,
+    "error": None,
+}
+SCAN_LOCK = threading.Lock()
+
+
+def connect() -> sqlite3.Connection:
+    DATA_ROOT.mkdir(parents=True, exist_ok=True)
+    THUMB_ROOT.mkdir(parents=True, exist_ok=True)
+    FULL_ROOT.mkdir(parents=True, exist_ok=True)
+    PREVIEW_ROOT.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(DB_PATH)
+    db.row_factory = sqlite3.Row
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS photos (
+            id TEXT PRIMARY KEY,
+            path TEXT NOT NULL UNIQUE,
+            directory TEXT NOT NULL,
+            stem TEXT NOT NULL,
+            ext TEXT NOT NULL,
+            raw_path TEXT,
+            width INTEGER,
+            height INTEGER,
+            created_at TEXT,
+            blur_score REAL,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            status TEXT NOT NULL DEFAULT 'unmarked',
+            warnings TEXT NOT NULL DEFAULT '[]',
+            updated_at REAL NOT NULL
+        )
+        """
+    )
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS orphan_raws (
+            id TEXT PRIMARY KEY,
+            path TEXT NOT NULL UNIQUE,
+            directory TEXT NOT NULL,
+            stem TEXT NOT NULL,
+            ext TEXT NOT NULL,
+            size_bytes INTEGER,
+            created_at TEXT,
+            updated_at REAL NOT NULL
+        )
+        """
+    )
+    try:
+        db.execute("ALTER TABLE photos ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'")
+    except sqlite3.OperationalError:
+        pass
+    db.execute("CREATE INDEX IF NOT EXISTS idx_photos_status ON photos(status)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_photos_stem ON photos(stem)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_orphan_raws_stem ON orphan_raws(stem)")
+    db.commit()
+    return db
+
+
+def photo_id(path: Path) -> str:
+    return hashlib.sha1(str(path.resolve()).encode("utf-8")).hexdigest()[:16]
+
+
+def json_response(handler: SimpleHTTPRequestHandler, payload, status=HTTPStatus.OK):
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("Content-Type", "application/json; charset=utf-8")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+def read_json(handler: SimpleHTTPRequestHandler):
+    length = int(handler.headers.get("Content-Length", "0"))
+    if length == 0:
+        return {}
+    return json.loads(handler.rfile.read(length).decode("utf-8"))
+
+
+def is_inside(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def should_skip(path: Path) -> bool:
+    return any(part in SKIP_DIRS or part.startswith(".") for part in path.parts)
+
+
+def scan_files(library: Path):
+    display_files: list[Path] = []
+    raw_by_key: dict[tuple[str, str], Path] = {}
+    for dirpath, dirnames, filenames in os.walk(library):
+        current = Path(dirpath)
+        dirnames[:] = [name for name in dirnames if name not in SKIP_DIRS and not name.startswith(".")]
+        if should_skip(current.relative_to(library)):
+            continue
+        for filename in filenames:
+            path = current / filename
+            ext = path.suffix.lower()
+            key = (str(current), path.stem.lower())
+            if ext in DISPLAY_EXTS:
+                display_files.append(path)
+            elif ext in RAW_EXTS:
+                raw_by_key[key] = path
+    return display_files, raw_by_key
+
+
+def run_sips_metadata(path: Path) -> dict:
+    try:
+        proc = subprocess.run(
+            ["sips", "-g", "pixelWidth", "-g", "pixelHeight", "-g", "creation", str(path)],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+        )
+    except Exception:
+        return {}
+    result = {}
+    for line in proc.stdout.splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.strip().split(":", 1)
+        key = key.strip()
+        value = value.strip()
+        if key in {"pixelWidth", "pixelHeight", "creation"}:
+            result[key] = value
+    return result
+
+
+def thumb_path_for(pid: str) -> Path:
+    return THUMB_ROOT / f"{pid}.jpg"
+
+
+def full_path_for(pid: str) -> Path:
+    return FULL_ROOT / f"{pid}.jpg"
+
+
+def preview_path_for(pid: str) -> Path:
+    return PREVIEW_ROOT / f"{pid}.jpg"
+
+
+def ensure_thumbnail(path: Path, pid: str) -> Path | None:
+    out = thumb_path_for(pid)
+    if out.exists() and out.stat().st_mtime >= path.stat().st_mtime:
+        return out
+    tmp = out.with_suffix(".tmp.jpg")
+    try:
+        tmp.unlink(missing_ok=True)
+        subprocess.run(
+            ["sips", "-s", "format", "jpeg", "-Z", "900", str(path), "--out", str(tmp)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+        )
+        tmp.replace(out)
+        return out
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        return None
+
+
+def ensure_smooth_preview(path: Path, pid: str) -> Path | None:
+    out = preview_path_for(pid)
+    if out.exists() and out.stat().st_mtime >= path.stat().st_mtime:
+        return out
+    tmp = out.with_suffix(".tmp.jpg")
+    try:
+        tmp.unlink(missing_ok=True)
+        subprocess.run(
+            ["sips", "-s", "format", "jpeg", "-Z", "2400", str(path), "--out", str(tmp)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=45,
+        )
+        tmp.replace(out)
+        return out
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        return None
+
+
+def ensure_full_preview(path: Path, pid: str) -> Path | None:
+    out = full_path_for(pid)
+    if out.exists() and out.stat().st_mtime >= path.stat().st_mtime:
+        return out
+    tmp = out.with_suffix(".tmp.jpg")
+    try:
+        tmp.unlink(missing_ok=True)
+        subprocess.run(
+            ["sips", "-s", "format", "jpeg", str(path), "--out", str(tmp)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=60,
+        )
+        tmp.replace(out)
+        return out
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        return None
+
+
+def estimate_blur_score(thumb: Path | None) -> float | None:
+    if not thumb or Image is None:
+        return None
+    try:
+        with Image.open(thumb) as image:
+            gray = image.convert("L").resize((320, 320))
+            edges = gray.filter(ImageFilter.FIND_EDGES)
+            stat = ImageStat.Stat(edges)
+            return round(float(stat.var[0]), 2)
+    except Exception:
+        return None
+
+
+def as_float(value) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except Exception:
+        try:
+            return float(value[0]) / float(value[1])
+        except Exception:
+            return None
+
+
+def format_shutter(seconds: float | None) -> str | None:
+    if not seconds or seconds <= 0:
+        return None
+    if seconds >= 1:
+        value = f"{seconds:.1f}".rstrip("0").rstrip(".")
+        return f"{value}s"
+    denominator = round(1 / seconds)
+    return f"1/{denominator}"
+
+
+def format_ev(value: float | None) -> str | None:
+    if value is None:
+        return None
+    if abs(value) < 0.005:
+        return "0 EV"
+    thirds = round(value * 3)
+    if abs(value - thirds / 3) < 0.03:
+        sign = "+" if thirds > 0 else "-"
+        whole = abs(thirds) // 3
+        remainder = abs(thirds) % 3
+        if remainder == 0:
+            return f"{sign}{whole} EV"
+        if whole == 0:
+            return f"{sign}{remainder}/3 EV"
+        return f"{sign}{whole} {remainder}/3 EV"
+    sign = "+" if value > 0 else ""
+    return f"{sign}{value:.2f} EV".replace(".00", "")
+
+
+def extract_exif(path: Path) -> dict:
+    if Image is None:
+        return {}
+    ext = path.suffix.lower()
+    exif = None
+    try:
+        if ext in {".jpg", ".jpeg"}:
+            with Image.open(path) as image:
+                exif = image.getexif()
+        elif ext in {".hif", ".heif", ".heic"}:
+            data = path.read_bytes()
+            tiff_index = data.find(b"II*\x00")
+            if tiff_index == -1:
+                tiff_index = data.find(b"MM\x00*")
+            if tiff_index == -1:
+                return {}
+            exif = Image.Exif()
+            exif.load(data[tiff_index:])
+    except Exception:
+        return {}
+    if not exif:
+        return {}
+    try:
+        exif_ifd = exif.get_ifd(34665)
+    except Exception:
+        exif_ifd = {}
+
+    iso = exif_ifd.get(34855) or exif_ifd.get(8833)
+    aperture = as_float(exif_ifd.get(33437))
+    exposure_time = as_float(exif_ifd.get(33434))
+    focal_length = as_float(exif_ifd.get(37386))
+    exposure_bias = as_float(exif_ifd.get(37380))
+
+    return {
+        "iso": f"ISO {iso}" if iso is not None else None,
+        "aperture": f"f/{aperture:.1f}".replace(".0", "") if aperture else None,
+        "shutter": format_shutter(exposure_time),
+        "focalLength": f"{focal_length:.0f}mm" if focal_length else None,
+        "exposureCompensation": format_ev(exposure_bias),
+        "capturedAt": exif_ifd.get(36867) or exif.get(306),
+    }
+
+
+def warnings_for(blur_score: float | None, raw_path: Path | None) -> list[str]:
+    warnings: list[str] = []
+    if blur_score is not None and blur_score < 180:
+        warnings.append("soft")
+    if raw_path is None:
+        warnings.append("no_raw_pair")
+    return warnings
+
+
+def process_photo(path: Path, raw_path: Path | None) -> dict:
+    pid = photo_id(path)
+    thumb = ensure_thumbnail(path, pid)
+    blur = estimate_blur_score(thumb)
+    width = None
+    height = None
+    if thumb and Image is not None:
+        try:
+            with Image.open(thumb) as image:
+                width, height = image.size
+        except Exception:
+            pass
+    created_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(path.stat().st_mtime))
+    warnings = warnings_for(blur, raw_path)
+    return {
+        "id": pid,
+        "path": str(path),
+        "directory": str(path.parent),
+        "stem": path.stem,
+        "ext": path.suffix.lower(),
+        "raw_path": str(raw_path) if raw_path else None,
+        "width": width,
+        "height": height,
+        "created_at": created_at,
+        "blur_score": blur,
+        "metadata_json": json.dumps(extract_exif(path)),
+        "warnings": json.dumps(warnings),
+        "updated_at": time.time(),
+    }
+
+
+def update_scan_job(**updates):
+    with SCAN_LOCK:
+        SCAN_JOB.update(updates)
+
+
+def scan_library(library: Path) -> dict:
+    if not library.exists() or not library.is_dir():
+        raise ValueError(f"Library folder does not exist: {library}")
+    display_files, raw_by_key = scan_files(library)
+    display_keys = {(str(path.parent), path.stem.lower()) for path in display_files}
+    orphan_raws = [path for key, path in raw_by_key.items() if key not in display_keys]
+    db = connect()
+    started = time.time()
+    update_scan_job(running=True, done=0, total=len(display_files), message="Generating thumbnails")
+    futures = {}
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        for path in display_files:
+            key = (str(path.parent), path.stem.lower())
+            futures[executor.submit(process_photo, path, raw_by_key.get(key))] = path
+
+        for index, future in enumerate(as_completed(futures), start=1):
+            item = future.result()
+            db.execute(
+                """
+                INSERT INTO photos (
+                    id, path, directory, stem, ext, raw_path, width, height,
+                    created_at, blur_score, metadata_json, warnings, updated_at
+                )
+                VALUES (
+                    :id, :path, :directory, :stem, :ext, :raw_path, :width, :height,
+                    :created_at, :blur_score, :metadata_json, :warnings, :updated_at
+                )
+                ON CONFLICT(id) DO UPDATE SET
+                    path=excluded.path,
+                    directory=excluded.directory,
+                    stem=excluded.stem,
+                    ext=excluded.ext,
+                    raw_path=excluded.raw_path,
+                    width=excluded.width,
+                    height=excluded.height,
+                    created_at=excluded.created_at,
+                    blur_score=excluded.blur_score,
+                    metadata_json=excluded.metadata_json,
+                    warnings=excluded.warnings,
+                    updated_at=excluded.updated_at
+                """,
+                item,
+            )
+            if index % 25 == 0:
+                db.commit()
+                update_scan_job(done=index, message=f"Processed {index} / {len(display_files)}")
+    db.commit()
+    db.execute("DELETE FROM orphan_raws")
+    for raw_path in orphan_raws:
+        stat = raw_path.stat()
+        db.execute(
+            """
+            INSERT INTO orphan_raws (
+                id, path, directory, stem, ext, size_bytes, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                path=excluded.path,
+                directory=excluded.directory,
+                stem=excluded.stem,
+                ext=excluded.ext,
+                size_bytes=excluded.size_bytes,
+                created_at=excluded.created_at,
+                updated_at=excluded.updated_at
+            """,
+            (
+                photo_id(raw_path),
+                str(raw_path),
+                str(raw_path.parent),
+                raw_path.stem,
+                raw_path.suffix.lower(),
+                stat.st_size,
+                time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stat.st_mtime)),
+                time.time(),
+            ),
+        )
+    db.commit()
+    update_scan_job(done=len(display_files), message="Finalizing")
+    total = db.execute("SELECT COUNT(*) AS count FROM photos").fetchone()["count"]
+    paired = db.execute("SELECT COUNT(*) AS count FROM photos WHERE raw_path IS NOT NULL").fetchone()["count"]
+    soft = db.execute("SELECT COUNT(*) AS count FROM photos WHERE warnings LIKE '%soft%'").fetchone()["count"]
+    orphan_count = db.execute("SELECT COUNT(*) AS count FROM orphan_raws").fetchone()["count"]
+    db.close()
+    result = {
+        "scanned": len(display_files),
+        "total": total,
+        "paired": paired,
+        "soft": soft,
+        "orphanRaws": orphan_count,
+        "seconds": round(time.time() - started, 2),
+    }
+    update_scan_job(running=False, result=result, message="Complete")
+    return result
+
+
+def start_scan(library: Path) -> dict:
+    with SCAN_LOCK:
+        if SCAN_JOB["running"]:
+            return {"started": False, "job": dict(SCAN_JOB)}
+        SCAN_JOB.update(
+            {
+                "running": True,
+                "done": 0,
+                "total": 0,
+                "message": "Starting",
+                "result": None,
+                "error": None,
+            }
+        )
+
+    def runner():
+        try:
+            scan_library(library)
+        except Exception as exc:
+            update_scan_job(running=False, error=str(exc), message="Failed")
+
+    threading.Thread(target=runner, daemon=True).start()
+    return {"started": True, "job": dict(SCAN_JOB)}
+
+
+def row_to_photo(row: sqlite3.Row) -> dict:
+    path = Path(row["path"])
+    metadata = json.loads(row["metadata_json"] or "{}") if "metadata_json" in row.keys() else {}
+    return {
+        "id": row["id"],
+        "filename": path.name,
+        "path": row["path"],
+        "rawPath": row["raw_path"],
+        "width": row["width"],
+        "height": row["height"],
+        "createdAt": row["created_at"],
+        "blurScore": row["blur_score"],
+        "metadata": metadata,
+        "status": row["status"],
+        "warnings": json.loads(row["warnings"] or "[]"),
+        "thumbUrl": f"/thumbs/{row['id']}.jpg",
+        "previewUrl": f"/api/photos/{row['id']}/preview",
+        "fullUrl": f"/api/photos/{row['id']}/full",
+        "originalUrl": f"/api/photos/{row['id']}/original",
+    }
+
+
+def photo_metadata(pid: str) -> dict:
+    db = connect()
+    row = db.execute("SELECT path, metadata_json FROM photos WHERE id = ?", (pid,)).fetchone()
+    if row is None:
+        db.close()
+        raise ValueError("Photo not found")
+    cached = json.loads(row["metadata_json"] or "{}")
+    path = Path(row["path"])
+    parsed = extract_exif(path) if path.exists() else {}
+    metadata = parsed if any(parsed.values()) else cached
+    if any(parsed.values()):
+        db.execute(
+            "UPDATE photos SET metadata_json = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(metadata), time.time(), pid),
+        )
+        db.commit()
+    db.close()
+    return metadata
+
+
+def full_preview(pid: str) -> Path:
+    db = connect()
+    row = db.execute("SELECT path FROM photos WHERE id = ?", (pid,)).fetchone()
+    db.close()
+    if row is None:
+        raise ValueError("Photo not found")
+    path = Path(row["path"])
+    if not path.exists():
+        raise ValueError("Source photo not found")
+    preview = ensure_full_preview(path, pid)
+    if preview is None or not preview.exists():
+        raise ValueError("Could not generate full preview")
+    return preview
+
+
+def smooth_preview(pid: str) -> Path:
+    db = connect()
+    row = db.execute("SELECT path FROM photos WHERE id = ?", (pid,)).fetchone()
+    db.close()
+    if row is None:
+        raise ValueError("Photo not found")
+    path = Path(row["path"])
+    if not path.exists():
+        raise ValueError("Source photo not found")
+    preview = ensure_smooth_preview(path, pid)
+    if preview is None or not preview.exists():
+        raise ValueError("Could not generate smooth preview")
+    return preview
+
+
+def original_photo(pid: str) -> tuple[Path, str]:
+    db = connect()
+    row = db.execute("SELECT path FROM photos WHERE id = ?", (pid,)).fetchone()
+    db.close()
+    if row is None:
+        raise ValueError("Photo not found")
+    path = Path(row["path"])
+    if not path.exists():
+        raise ValueError("Source photo not found")
+    content_type = MIME_TYPES.get(path.suffix.lower()) or mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    return path, content_type
+
+
+def send_file(handler: SimpleHTTPRequestHandler, path: Path, content_type: str):
+    handler.send_response(HTTPStatus.OK)
+    handler.send_header("Content-Type", content_type)
+    handler.send_header("Content-Length", str(path.stat().st_size))
+    handler.send_header("Cache-Control", "private, max-age=3600")
+    handler.end_headers()
+    with path.open("rb") as file:
+        shutil.copyfileobj(file, handler.wfile)
+
+
+def list_photos(query: dict) -> dict:
+    status = query.get("status", [""])[0]
+    warning = query.get("warning", [""])[0]
+    search = query.get("search", [""])[0].strip().lower()
+    limit = min(int(query.get("limit", ["300"])[0]), 1000)
+    offset = int(query.get("offset", ["0"])[0])
+    clauses = []
+    params: list[object] = []
+    if status:
+        clauses.append("status = ?")
+        params.append(status)
+    if warning:
+        clauses.append("warnings LIKE ?")
+        params.append(f"%{warning}%")
+    if search:
+        clauses.append("LOWER(stem) LIKE ?")
+        params.append(f"%{search}%")
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    db = connect()
+    rows = db.execute(
+        f"""
+        SELECT * FROM photos
+        {where}
+        ORDER BY created_at IS NULL, created_at, filename
+        LIMIT ? OFFSET ?
+        """.replace("filename", "path"),
+        (*params, limit, offset),
+    ).fetchall()
+    count = db.execute(f"SELECT COUNT(*) AS count FROM photos {where}", params).fetchone()["count"]
+    stats_rows = db.execute("SELECT status, COUNT(*) AS count FROM photos GROUP BY status").fetchall()
+    db.close()
+    return {
+        "photos": [row_to_photo(row) for row in rows],
+        "count": count,
+        "stats": {row["status"]: row["count"] for row in stats_rows},
+    }
+
+
+def row_to_orphan_raw(row: sqlite3.Row) -> dict:
+    path = Path(row["path"])
+    return {
+        "id": row["id"],
+        "filename": path.name,
+        "path": row["path"],
+        "sizeBytes": row["size_bytes"],
+        "createdAt": row["created_at"],
+    }
+
+
+def list_orphan_raws(query: dict) -> dict:
+    search = query.get("search", [""])[0].strip().lower()
+    limit = min(int(query.get("limit", ["300"])[0]), 1000)
+    offset = int(query.get("offset", ["0"])[0])
+    clauses = []
+    params: list[object] = []
+    if search:
+        clauses.append("LOWER(stem) LIKE ?")
+        params.append(f"%{search}%")
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    db = connect()
+    rows = db.execute(
+        f"""
+        SELECT * FROM orphan_raws
+        {where}
+        ORDER BY created_at IS NULL, created_at, path
+        LIMIT ? OFFSET ?
+        """,
+        (*params, limit, offset),
+    ).fetchall()
+    count = db.execute(f"SELECT COUNT(*) AS count FROM orphan_raws {where}", params).fetchone()["count"]
+    db.close()
+    return {
+        "orphanRaws": [row_to_orphan_raw(row) for row in rows],
+        "count": count,
+    }
+
+
+def mark_photo(pid: str, status: str) -> dict:
+    if status not in {"unmarked", "keep", "review", "reject"}:
+        raise ValueError("Invalid status")
+    db = connect()
+    db.execute("UPDATE photos SET status = ?, updated_at = ? WHERE id = ?", (status, time.time(), pid))
+    db.commit()
+    row = db.execute("SELECT * FROM photos WHERE id = ?", (pid,)).fetchone()
+    db.close()
+    if row is None:
+        raise ValueError("Photo not found")
+    return row_to_photo(row)
+
+
+def unique_destination(path: Path, rejected_root: Path) -> Path:
+    dest = rejected_root / path.name
+    if not dest.exists():
+        return dest
+    counter = 1
+    while True:
+        candidate = rejected_root / f"{path.stem}-{counter}{path.suffix}"
+        if not candidate.exists():
+            return candidate
+        counter += 1
+
+
+def move_rejected(library: Path) -> dict:
+    rejected_root = library / "_PHOTO_CULLER_REJECTED"
+    rejected_root.mkdir(exist_ok=True)
+    db = connect()
+    rows = db.execute("SELECT * FROM photos WHERE status = 'reject'").fetchall()
+    moved = []
+    for row in rows:
+        pid = row["id"]
+        paths = [Path(row["path"])]
+        if row["raw_path"]:
+            paths.append(Path(row["raw_path"]))
+        moved_paths = []
+        for src in paths:
+            if not src.exists() or not is_inside(src, library):
+                continue
+            dest = unique_destination(src, rejected_root)
+            shutil.move(str(src), str(dest))
+            moved_paths.append(str(dest))
+        if moved_paths:
+            db.execute("DELETE FROM photos WHERE id = ?", (pid,))
+            moved.append({"id": pid, "destinations": moved_paths})
+    db.commit()
+    db.close()
+    return {"moved": moved, "count": len(moved)}
+
+
+def move_orphan_raws(library: Path) -> dict:
+    orphan_root = library / "_PHOTO_CULLER_ORPHAN_RAW"
+    orphan_root.mkdir(exist_ok=True)
+    db = connect()
+    rows = db.execute("SELECT * FROM orphan_raws").fetchall()
+    moved = []
+    for row in rows:
+        src = Path(row["path"])
+        if not src.exists() or not is_inside(src, library):
+            continue
+        dest = unique_destination(src, orphan_root)
+        shutil.move(str(src), str(dest))
+        db.execute("DELETE FROM orphan_raws WHERE id = ?", (row["id"],))
+        moved.append({"id": row["id"], "destination": str(dest)})
+    db.commit()
+    db.close()
+    return {"moved": moved, "count": len(moved)}
+
+
+class Handler(SimpleHTTPRequestHandler):
+    library: Path = ROOT
+
+    def translate_path(self, path):
+        parsed = urlparse(path)
+        if parsed.path.startswith("/thumbs/"):
+            name = Path(unquote(parsed.path.replace("/thumbs/", ""))).name
+            return str(THUMB_ROOT / name)
+        if parsed.path.startswith("/full/"):
+            name = Path(unquote(parsed.path.replace("/full/", ""))).name
+            return str(FULL_ROOT / name)
+        if parsed.path.startswith("/preview/"):
+            name = Path(unquote(parsed.path.replace("/preview/", ""))).name
+            return str(PREVIEW_ROOT / name)
+        if parsed.path == "/":
+            return str(WEB_ROOT / "index.html")
+        return str(WEB_ROOT / parsed.path.lstrip("/"))
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        if parsed.path == "/api/photos":
+            try:
+                json_response(self, list_photos(parse_qs(parsed.query)))
+            except Exception as exc:
+                json_response(self, {"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        if parsed.path == "/api/orphan-raws":
+            try:
+                json_response(self, list_orphan_raws(parse_qs(parsed.query)))
+            except Exception as exc:
+                json_response(self, {"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        if parsed.path == "/api/config":
+            json_response(self, {"library": str(self.library), "db": str(DB_PATH)})
+            return
+        if parsed.path == "/api/scan-status":
+            with SCAN_LOCK:
+                json_response(self, dict(SCAN_JOB))
+            return
+        if parsed.path.startswith("/api/photos/") and parsed.path.endswith("/metadata"):
+            try:
+                pid = parsed.path.split("/")[3]
+                json_response(self, photo_metadata(pid))
+            except Exception as exc:
+                json_response(self, {"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        if parsed.path.startswith("/api/photos/") and parsed.path.endswith("/full"):
+            try:
+                pid = parsed.path.split("/")[3]
+                self.path = f"/full/{full_preview(pid).name}"
+                super().do_GET()
+            except Exception as exc:
+                json_response(self, {"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        if parsed.path.startswith("/api/photos/") and parsed.path.endswith("/preview"):
+            try:
+                pid = parsed.path.split("/")[3]
+                self.path = f"/preview/{smooth_preview(pid).name}"
+                super().do_GET()
+            except Exception as exc:
+                json_response(self, {"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        if parsed.path.startswith("/api/photos/") and parsed.path.endswith("/original"):
+            try:
+                pid = parsed.path.split("/")[3]
+                path, content_type = original_photo(pid)
+                send_file(self, path, content_type)
+            except Exception as exc:
+                json_response(self, {"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        super().do_GET()
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        try:
+            if parsed.path == "/api/scan":
+                payload = read_json(self)
+                library = Path(payload.get("library") or self.library).expanduser().resolve()
+                self.__class__.library = library
+                json_response(self, start_scan(library))
+                return
+            if parsed.path.startswith("/api/photos/") and parsed.path.endswith("/mark"):
+                pid = parsed.path.split("/")[3]
+                payload = read_json(self)
+                json_response(self, mark_photo(pid, payload.get("status", "unmarked")))
+                return
+            if parsed.path == "/api/move-rejected":
+                json_response(self, move_rejected(self.library))
+                return
+            if parsed.path == "/api/move-orphan-raws":
+                json_response(self, move_orphan_raws(self.library))
+                return
+            json_response(self, {"error": "Not found"}, HTTPStatus.NOT_FOUND)
+        except Exception as exc:
+            json_response(self, {"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--library", default=str(ROOT), help="Photo library folder")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8765)
+    args = parser.parse_args(argv)
+
+    Handler.library = Path(args.library).expanduser().resolve()
+    connect().close()
+    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    print(f"Photo Culler running at http://{args.host}:{args.port}")
+    print(f"Library: {Handler.library}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopping.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
