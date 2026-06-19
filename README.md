@@ -5,7 +5,14 @@ Local-first photo culling MVP for HEIF/HIF + RAW workflows.
 ## Requirements
 
 - macOS with `sips`
-- Python 3 with Pillow installed
+- Python 3 with Pillow installed:
+  - pip: `python3 -m pip install Pillow`
+  - conda: `conda install pillow`
+  - HIF/HEIF support depends on the Python environment and native image libraries. If your Pillow build cannot read HIF metadata, install `exiftool` below; Photo Culler will use it as a fallback.
+- Optional: `exiftool` for camera-brand-specific metadata badges, such as Fujifilm DR and film simulation.
+  - macOS: `brew install exiftool`
+  - Linux: install `libimage-exiftool-perl` with your package manager, for example `sudo apt install libimage-exiftool-perl`
+  - Windows: install ExifTool from <https://exiftool.org/> or with a package manager such as Chocolatey: `choco install exiftool`
 
 ## Run
 
@@ -28,6 +35,7 @@ http://127.0.0.1:8765
 - Detects orphan RAW files that do not have matching display images.
 - Generates JPEG thumbnails with macOS `sips`.
 - Reads common EXIF fields for the viewer.
+- Shows camera-brand-specific badges when `exiftool` is installed.
 - Stores culling state in SQLite.
 - Lets you mark photos as keep / review / reject from a web UI.
 - Moves rejected display files and paired RAW files into `_PHOTO_CULLER_REJECTED/`.

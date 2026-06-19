@@ -385,9 +385,154 @@ def format_ev(value: float | None) -> str | None:
     return f"{sign}{value:.2f} EV".replace(".00", "")
 
 
-def extract_exif(path: Path) -> dict:
-    if Image is None:
+def compact_badge(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def exiftool_float(value: object) -> float | None:
+    text = compact_badge(value)
+    if not text:
+        return None
+    if "/" in text:
+        try:
+            numerator, denominator = text.split("/", 1)
+            return float(numerator) / float(denominator)
+        except Exception:
+            return None
+    try:
+        return float(text.split()[0])
+    except Exception:
+        return None
+
+
+def compact_fuji_film_mode(value: object) -> str | None:
+    text = compact_badge(value)
+    if not text:
+        return None
+    if "(" in text and ")" in text:
+        short_name = text.rsplit("(", 1)[1].split(")", 1)[0].strip()
+        if short_name:
+            return short_name
+    if "/" in text:
+        text = text.split("/", 1)[1].strip()
+    return text or None
+
+
+def fuji_brand_badges(tags: dict) -> list[str]:
+    badges: list[str] = []
+    dynamic_range = compact_badge(tags.get("DevelopmentDynamicRange") or tags.get("DynamicRange"))
+    if dynamic_range and dynamic_range.lower() != "standard":
+        badges.append(dynamic_range.upper() if dynamic_range.upper().startswith("DR") else f"DR{dynamic_range}")
+    elif dynamic_range:
+        badges.append("DR100")
+
+    film = compact_fuji_film_mode(tags.get("FilmMode") or tags.get("FilmSimulation"))
+    if film:
+        badges.append(f"Film {film}")
+
+    white_balance = compact_badge(tags.get("WhiteBalance"))
+    if white_balance and white_balance.lower() not in {"auto", "unknown"}:
+        badges.append(f"WB {white_balance}")
+
+    color_chrome = compact_badge(tags.get("ColorChromeEffect"))
+    if color_chrome and color_chrome.lower() not in {"off", "none"}:
+        badges.append(f"Chrome {color_chrome}")
+
+    chrome_blue = compact_badge(tags.get("ColorChromeFXBlue"))
+    if chrome_blue and chrome_blue.lower() not in {"off", "none"}:
+        badges.append(f"Blue {chrome_blue}")
+
+    return badges
+
+
+def read_exiftool_tags(path: Path, tags: list[str]) -> dict:
+    if not shutil.which("exiftool"):
         return {}
+    try:
+        proc = subprocess.run(
+            ["exiftool", "-json", *tags, str(path)],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+        )
+    except Exception:
+        return {}
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return {}
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return {}
+    if not payload:
+        return {}
+    return payload[0]
+
+
+def extract_brand_badges(path: Path) -> list[str]:
+    tags = read_exiftool_tags(
+        path,
+        [
+            "-Make",
+            "-DynamicRange",
+            "-DynamicRangeSetting",
+            "-DevelopmentDynamicRange",
+            "-FilmMode",
+            "-FilmSimulation",
+            "-WhiteBalance",
+            "-ColorChromeEffect",
+            "-ColorChromeFXBlue",
+        ],
+    )
+    if not tags:
+        return []
+    make = compact_badge(tags.get("Make")) or ""
+    if "fujifilm" in make.lower():
+        return fuji_brand_badges(tags)
+    return []
+
+
+def extract_exiftool_metadata(path: Path) -> dict:
+    tags = read_exiftool_tags(
+        path,
+        [
+            "-ISO",
+            "-FNumber",
+            "-ExposureTime",
+            "-FocalLength",
+            "-ExposureCompensation",
+            "-DateTimeOriginal",
+            "-CreateDate",
+        ],
+    )
+    if not tags:
+        return {}
+    iso = compact_badge(tags.get("ISO"))
+    aperture = exiftool_float(tags.get("FNumber"))
+    exposure_time = exiftool_float(tags.get("ExposureTime"))
+    focal_length = exiftool_float(tags.get("FocalLength"))
+    exposure_bias = exiftool_float(tags.get("ExposureCompensation"))
+    return {
+        "iso": f"ISO {iso}" if iso is not None else None,
+        "aperture": f"f/{aperture:.1f}".replace(".0", "") if aperture else None,
+        "shutter": format_shutter(exposure_time),
+        "focalLength": f"{focal_length:.0f}mm" if focal_length else None,
+        "exposureCompensation": format_ev(exposure_bias),
+        "capturedAt": tags.get("DateTimeOriginal") or tags.get("CreateDate"),
+    }
+
+
+def extract_exif(path: Path) -> dict:
+    brand_badges = extract_brand_badges(path)
+    exiftool_metadata = extract_exiftool_metadata(path)
+    if brand_badges:
+        exiftool_metadata["brandBadges"] = brand_badges
+    if Image is None:
+        return exiftool_metadata
     ext = path.suffix.lower()
     exif = None
     try:
@@ -400,13 +545,13 @@ def extract_exif(path: Path) -> dict:
             if tiff_index == -1:
                 tiff_index = data.find(b"MM\x00*")
             if tiff_index == -1:
-                return {}
+                return exiftool_metadata
             exif = Image.Exif()
             exif.load(data[tiff_index:])
     except Exception:
-        return {}
+        return exiftool_metadata
     if not exif:
-        return {}
+        return exiftool_metadata
     try:
         exif_ifd = exif.get_ifd(34665)
     except Exception:
@@ -425,6 +570,7 @@ def extract_exif(path: Path) -> dict:
         "focalLength": f"{focal_length:.0f}mm" if focal_length else None,
         "exposureCompensation": format_ev(exposure_bias),
         "capturedAt": exif_ifd.get(36867) or exif.get(306),
+        "brandBadges": brand_badges,
     }
 
 
@@ -658,6 +804,7 @@ def saved_status(db: sqlite3.Connection, pid: str, path: str) -> str:
 def row_to_photo(row: sqlite3.Row) -> dict:
     path = Path(row["path"])
     metadata = json.loads(row["metadata_json"] or "{}") if "metadata_json" in row.keys() else {}
+    metadata.setdefault("brandBadges", [])
     return {
         "id": row["id"],
         "filename": path.name,
@@ -686,7 +833,10 @@ def photo_metadata(pid: str) -> dict:
     cached = json.loads(row["metadata_json"] or "{}")
     path = Path(row["path"])
     parsed = extract_exif(path) if path.exists() else {}
-    metadata = parsed if any(parsed.values()) else cached
+    metadata = dict(cached)
+    if any(parsed.values()):
+        metadata.update({key: value for key, value in parsed.items() if value is not None})
+    metadata.setdefault("brandBadges", [])
     if any(parsed.values()):
         db.execute(
             "UPDATE photos SET metadata_json = ?, updated_at = ? WHERE id = ?",

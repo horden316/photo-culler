@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Photo Culler</title>
-    <link rel="stylesheet" href="/styles.css?v=nav2" />
+    <link rel="stylesheet" href="/styles.css?v=viewer-layout" />
   </head>
   <body>
     <header class="topbar">
@@ -47,10 +47,18 @@
         <img id="viewerImg" alt="" />
       </div>
       <div class="viewerInfo">
-        <strong id="viewerName"></strong>
-        <span id="viewerSource" class="sourceBadge"></span>
-        <span id="viewerMeta"></span>
-        <span id="viewerExposure" class="exposureInfo"></span>
+        <div class="viewerTitle">
+          <strong id="viewerName"></strong>
+          <span id="viewerPosition" class="viewerPosition"></span>
+        </div>
+        <div class="viewerDetails">
+          <div class="viewerBadges">
+            <span id="viewerSource" class="sourceBadge"></span>
+            <span id="viewerMeta"></span>
+            <span id="viewerBrandBadges" class="brandBadges"></span>
+          </div>
+          <span id="viewerExposure" class="exposureInfo"></span>
+        </div>
         <div class="viewerActions">
           <button id="zoomOut" type="button">-</button>
           <button id="zoomFit" type="button">Fit</button>
@@ -80,6 +88,6 @@
       </div>
     </dialog>
 
-    <script src="/app.js?v=nav2"></script>
+    <script src="/app.js?v=viewer-layout"></script>
   </body>
 </html>

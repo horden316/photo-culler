@@ -188,6 +188,19 @@ main {
   padding: 0 8px;
 }
 
+.brandBadge {
+  background: #dcebe5;
+  color: #226d58;
+}
+
+.brandBadges {
+  display: flex;
+  flex: 0 1 auto;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
 .sourceBadge.original {
   background: #226d58;
   color: #ffffff;
@@ -350,31 +363,62 @@ dialog::backdrop {
 
 .viewerInfo {
   align-items: center;
-  display: flex;
+  display: grid;
   gap: 14px;
-  justify-content: space-between;
+  grid-template-columns: minmax(180px, 0.7fr) minmax(320px, 1.4fr) auto;
   min-width: 0;
   padding: 12px;
 }
 
-#viewerName,
-#viewerMeta {
-  flex: 0 1 auto;
+.viewerTitle {
+  display: grid;
+  gap: 2px;
   min-width: 0;
 }
 
-.exposureInfo {
-  color: #4e4a43;
-  flex: 1 1 auto;
-  font-size: 13px;
+#viewerName {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
+.viewerPosition {
+  color: #55514a;
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.viewerDetails {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+}
+
+.viewerBadges {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  min-width: 0;
+}
+
+#viewerMeta {
+  color: #202124;
+  font-size: 14px;
+  min-width: 0;
+}
+
+.exposureInfo {
+  color: #4e4a43;
+  font-size: 13px;
+  line-height: 1.35;
+  min-width: 0;
+  white-space: normal;
+}
+
 .viewerActions {
-  flex: 0 0 auto;
+  justify-content: flex-end;
 }
 
 .viewerActions [data-mark].selected {
@@ -407,10 +451,23 @@ dialog::backdrop {
 }
 
 @media (max-width: 720px) {
-  .topbar,
-  .viewerInfo {
+  .topbar {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .viewerInfo {
+    align-items: stretch;
+    grid-template-columns: 1fr;
+  }
+
+  .viewerActions {
+    flex-wrap: wrap;
+    justify-content: stretch;
+  }
+
+  .viewerActions button {
+    flex: 1 1 auto;
   }
 
   .filters {

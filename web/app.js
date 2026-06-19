@@ -23,8 +23,10 @@ const viewer = document.querySelector("#viewer");
 const imageStage = document.querySelector("#imageStage");
 const viewerImg = document.querySelector("#viewerImg");
 const viewerName = document.querySelector("#viewerName");
+const viewerPosition = document.querySelector("#viewerPosition");
 const viewerMeta = document.querySelector("#viewerMeta");
 const viewerExposure = document.querySelector("#viewerExposure");
+const viewerBrandBadges = document.querySelector("#viewerBrandBadges");
 const viewerSource = document.querySelector("#viewerSource");
 const scanBtn = document.querySelector("#scanBtn");
 const scanControlBtn = document.querySelector("#scanControlBtn");
@@ -242,11 +244,31 @@ function formatExposureInfo(metadata = {}) {
   return parts.length ? parts.join(" · ") : "EXIF n/a";
 }
 
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function renderBrandBadges(metadata = {}) {
+  return (metadata.brandBadges || []).map((badge) => `<span class="badge brandBadge">${escapeHtml(badge)}</span>`).join("");
+}
+
+function syncViewerBrandBadges(metadata = {}) {
+  viewerBrandBadges.innerHTML = renderBrandBadges(metadata);
+}
+
 async function loadExposureInfo(photo) {
   viewerExposure.textContent = "Loading EXIF...";
   try {
     const metadata = await api(`/api/photos/${photo.id}/metadata`);
     if (!state.selected || state.selected.id !== photo.id) return;
+    photo.metadata = metadata;
+    syncViewerBrandBadges(metadata);
+    replacePhotoCard(photo);
     viewerExposure.textContent = formatExposureInfo(metadata);
   } catch {
     if (!state.selected || state.selected.id !== photo.id) return;
@@ -284,6 +306,7 @@ function renderCard(photo, index) {
         ${photo.rawPath ? `<span class="badge">RAW</span>` : ""}
       </div>
       <div class="badges">
+        ${renderBrandBadges(photo.metadata)}
         ${photo.warnings.map((warning) => `<span class="badge">${warning}</span>`).join("")}
       </div>
       <div class="mark">
@@ -431,8 +454,10 @@ function updateViewerNavButtons() {
 function showViewerPhoto(photo, index) {
   state.selected = photo;
   state.selectedIndex = index;
-  viewerName.textContent = `${photo.filename} · ${index + 1}/${state.photoCount || state.photos.length}`;
+  viewerName.textContent = photo.filename;
+  viewerPosition.textContent = `${index + 1}/${state.photoCount || state.photos.length}`;
   syncViewerStatus(photo);
+  syncViewerBrandBadges(photo.metadata);
   viewerExposure.textContent = formatExposureInfo(photo.metadata);
   updateViewerNavButtons();
   loadViewerImage(photo);
