@@ -83,6 +83,11 @@ function showChooseFolderPrompt() {
   summary.textContent = "Choose a folder to start scanning photos.";
 }
 
+function syncLoadMoreVisibility(count, loadedAny = true) {
+  const loaded = state.view === "orphan_raws" ? state.orphanRaws.length : state.photos.length;
+  loadMore.hidden = !loadedAny || loaded >= count;
+}
+
 function renderFolderButton(item) {
   const button = document.createElement("button");
   button.type = "button";
@@ -359,7 +364,7 @@ async function loadPhotos({ reset = false } = {}) {
   state.photos = reset ? payload.photos : payload.photos;
   state.photoCount = payload.count;
   summary.textContent = `${payload.count} photos · keep ${payload.stats.keep || 0} · review ${payload.stats.review || 0} · reject ${payload.stats.reject || 0}`;
-  loadMore.hidden = state.offset + state.limit >= payload.count;
+  syncLoadMoreVisibility(payload.count, payload.photos.length > 0);
   render(false);
 }
 
@@ -372,7 +377,7 @@ async function loadOrphanRaws({ append = false } = {}) {
   const payload = await api(`/api/orphan-raws?${params}`);
   state.orphanRaws = append ? state.orphanRaws.concat(payload.orphanRaws) : payload.orphanRaws;
   summary.textContent = `${payload.count} orphan RAW files`;
-  loadMore.hidden = state.offset + state.limit >= payload.count;
+  syncLoadMoreVisibility(payload.count, payload.orphanRaws.length > 0);
   render(false);
 }
 
@@ -449,7 +454,7 @@ async function fetchNextPhotoPage() {
   const payload = await api(`/api/photos?${params}`);
   state.photos = state.photos.concat(payload.photos);
   state.photoCount = payload.count;
-  loadMore.hidden = state.photos.length >= payload.count;
+  syncLoadMoreVisibility(payload.count, payload.photos.length > 0);
   render(false);
   return payload.photos.length > 0;
 }
@@ -562,19 +567,21 @@ document.querySelector("#search").addEventListener("input", async (event) => {
 });
 
 loadMore.addEventListener("click", async () => {
-  state.offset += state.limit;
   if (state.view === "orphan_raws") {
+    state.offset = state.orphanRaws.length;
     await loadOrphanRaws({ append: true });
     return;
   }
+  state.offset = state.photos.length;
   const params = new URLSearchParams({ limit: state.limit, offset: state.offset });
   if (state.status) params.set("status", state.status);
   if (state.warning) params.set("warning", state.warning);
   if (state.search) params.set("search", state.search);
   const payload = await api(`/api/photos?${params}`);
   state.photos = state.photos.concat(payload.photos);
+  state.photoCount = payload.count;
   render(false);
-  loadMore.hidden = state.offset + state.limit >= payload.count;
+  syncLoadMoreVisibility(payload.count, payload.photos.length > 0);
 });
 
 grid.addEventListener("click", async (event) => {

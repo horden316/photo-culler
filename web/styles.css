@@ -18,6 +18,10 @@ input {
   font: inherit;
 }
 
+[hidden] {
+  display: none !important;
+}
+
 .topbar {
   align-items: center;
   background: #ffffff;
