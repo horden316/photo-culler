@@ -401,7 +401,9 @@ scanBtn.addEventListener("click", async () => {
 });
 
 document.querySelector("#moveBtn").addEventListener("click", async () => {
-  const ok = confirm("Move rejected display files and paired RAW files into _PHOTO_CULLER_REJECTED?");
+  const payload = await api("/api/photos?status=reject&limit=1");
+  const count = payload.count || 0;
+  const ok = confirm(`Move ${count} rejected photo${count === 1 ? "" : "s"} and paired RAW files into _PHOTO_CULLER_REJECTED?`);
   if (!ok) return;
   const result = await api("/api/move-rejected", { method: "POST", body: "{}" });
   alert(`Moved ${result.count} rejected photos.`);
@@ -409,7 +411,9 @@ document.querySelector("#moveBtn").addEventListener("click", async () => {
 });
 
 document.querySelector("#moveOrphanBtn").addEventListener("click", async () => {
-  const ok = confirm("Move all orphan RAW files into _PHOTO_CULLER_ORPHAN_RAW?");
+  const payload = await api("/api/orphan-raws?limit=1");
+  const count = payload.count || 0;
+  const ok = confirm(`Move ${count} orphan RAW file${count === 1 ? "" : "s"} into _PHOTO_CULLER_ORPHAN_RAW?`);
   if (!ok) return;
   const result = await api("/api/move-orphan-raws", { method: "POST", body: "{}" });
   alert(`Moved ${result.count} orphan RAW files.`);
