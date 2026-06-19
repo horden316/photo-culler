@@ -53,6 +53,11 @@ SCAN_JOB = {
     "error": None,
 }
 SCAN_LOCK = threading.Lock()
+DEFAULT_WORKERS = 8
+
+
+def default_library() -> Path:
+    return Path.home()
 
 
 def connect() -> sqlite3.Connection:
@@ -137,6 +142,37 @@ def is_inside(path: Path, root: Path) -> bool:
 
 def should_skip(path: Path) -> bool:
     return any(part in SKIP_DIRS or part.startswith(".") for part in path.parts)
+
+
+def list_directory(path: Path | None = None) -> dict:
+    current = (path or default_library()).expanduser().resolve()
+    if not current.exists() or not current.is_dir():
+        raise ValueError(f"Folder does not exist: {current}")
+    directories = []
+    for child in current.iterdir():
+        if child.name.startswith(".") or child.name in SKIP_DIRS:
+            continue
+        try:
+            if child.is_dir():
+                directories.append({"name": child.name, "path": str(child.resolve())})
+        except OSError:
+            continue
+    directories.sort(key=lambda item: item["name"].lower())
+    shortcuts = [
+        ("Home", Path.home()),
+        ("Desktop", Path.home() / "Desktop"),
+        ("Pictures", Path.home() / "Pictures"),
+    ]
+    return {
+        "path": str(current),
+        "parent": str(current.parent) if current.parent != current else None,
+        "directories": directories,
+        "shortcuts": [
+            {"name": name, "path": str(folder.resolve())}
+            for name, folder in shortcuts
+            if folder.exists() and folder.is_dir()
+        ],
+    }
 
 
 def scan_files(library: Path):
@@ -762,7 +798,9 @@ def move_orphan_raws(library: Path) -> dict:
 
 
 class Handler(SimpleHTTPRequestHandler):
-    library: Path = ROOT
+    library: Path = default_library()
+    library_selected: bool = False
+    workers: int = DEFAULT_WORKERS
 
     def translate_path(self, path):
         parsed = urlparse(path)
@@ -794,7 +832,23 @@ class Handler(SimpleHTTPRequestHandler):
                 json_response(self, {"error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return
         if parsed.path == "/api/config":
-            json_response(self, {"library": str(self.library), "db": str(DB_PATH)})
+            json_response(
+                self,
+                {
+                    "library": str(self.library),
+                    "librarySelected": self.library_selected,
+                    "workers": self.workers,
+                    "db": str(DB_PATH),
+                },
+            )
+            return
+        if parsed.path == "/api/browse":
+            try:
+                query = parse_qs(parsed.query)
+                path = query.get("path", [None])[0]
+                json_response(self, list_directory(Path(path) if path else self.library))
+            except Exception as exc:
+                json_response(self, {"error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return
         if parsed.path == "/api/scan-status":
             with SCAN_LOCK:
@@ -840,6 +894,7 @@ class Handler(SimpleHTTPRequestHandler):
                 payload = read_json(self)
                 library = Path(payload.get("library") or self.library).expanduser().resolve()
                 self.__class__.library = library
+                self.__class__.library_selected = True
                 json_response(self, start_scan(library))
                 return
             if parsed.path.startswith("/api/photos/") and parsed.path.endswith("/mark"):
@@ -860,12 +915,13 @@ class Handler(SimpleHTTPRequestHandler):
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--library", default=str(ROOT), help="Photo library folder")
+    parser.add_argument("--library", default=None, help="Photo library folder")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args(argv)
 
-    Handler.library = Path(args.library).expanduser().resolve()
+    Handler.library = Path(args.library).expanduser().resolve() if args.library else default_library().resolve()
+    Handler.library_selected = args.library is not None
     connect().close()
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"Photo Culler running at http://{args.host}:{args.port}")

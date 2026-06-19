@@ -13,6 +13,7 @@
         <p id="libraryPath"></p>
       </div>
       <div class="actions">
+        <button id="chooseFolderBtn">Choose Folder</button>
         <button id="scanBtn">Scan</button>
         <button id="moveOrphanBtn">Move Orphan RAWs</button>
         <button id="moveBtn" class="danger">Move Rejects</button>
@@ -57,6 +58,24 @@
           <button data-mark="review">Review</button>
           <button data-mark="reject" class="danger">Reject</button>
         </div>
+      </div>
+    </dialog>
+
+    <dialog id="folderDialog" class="folderDialog">
+      <form method="dialog">
+        <button class="close">Close</button>
+      </form>
+      <div class="folderPicker">
+        <div class="folderHeader">
+          <strong>Choose Folder</strong>
+          <div id="folderPath" class="folderPath"></div>
+        </div>
+        <div id="folderShortcuts" class="folderShortcuts"></div>
+        <div class="folderToolbar">
+          <button id="folderUpBtn" type="button">Up</button>
+          <button id="useFolderBtn" type="button">Use This Folder</button>
+        </div>
+        <div id="folderList" class="folderList"></div>
       </div>
     </dialog>
 

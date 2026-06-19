@@ -231,6 +231,73 @@ main {
   margin: 20px auto 0;
 }
 
+.folderDialog {
+  width: min(720px, 94vw);
+}
+
+.folderPicker {
+  display: grid;
+  gap: 14px;
+  padding: 18px;
+}
+
+.folderHeader {
+  display: grid;
+  gap: 6px;
+  padding-right: 72px;
+}
+
+.folderPath {
+  color: #66645f;
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.folderShortcuts,
+.folderToolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.folderToolbar {
+  justify-content: space-between;
+}
+
+.folderList {
+  border: 1px solid #ddd8cc;
+  border-radius: 8px;
+  display: grid;
+  max-height: min(52vh, 520px);
+  overflow: auto;
+}
+
+.folderItem {
+  background: #ffffff;
+  border: 0;
+  border-bottom: 1px solid #eee8dc;
+  border-radius: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  min-height: 42px;
+  overflow: hidden;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.folderItem:last-child {
+  border-bottom: 0;
+}
+
+.emptyFolder {
+  color: #66645f;
+  padding: 18px;
+}
+
 dialog {
   border: 0;
   border-radius: 8px;

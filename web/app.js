@@ -10,6 +10,10 @@ const state = {
   orphanRaws: [],
   selected: null,
   selectedIndex: -1,
+  library: "",
+  librarySelected: false,
+  browsePath: "",
+  browseParent: null,
 };
 
 const grid = document.querySelector("#grid");
@@ -23,6 +27,14 @@ const viewerMeta = document.querySelector("#viewerMeta");
 const viewerExposure = document.querySelector("#viewerExposure");
 const viewerSource = document.querySelector("#viewerSource");
 const scanBtn = document.querySelector("#scanBtn");
+const scanControlBtn = document.querySelector("#scanControlBtn");
+const chooseFolderBtn = document.querySelector("#chooseFolderBtn");
+const folderDialog = document.querySelector("#folderDialog");
+const folderPath = document.querySelector("#folderPath");
+const folderList = document.querySelector("#folderList");
+const folderShortcuts = document.querySelector("#folderShortcuts");
+const folderUpBtn = document.querySelector("#folderUpBtn");
+const useFolderBtn = document.querySelector("#useFolderBtn");
 const zoomState = {
   scale: 1,
   x: 0,
@@ -57,6 +69,55 @@ async function api(path, options = {}) {
 
 function formatScore(score) {
   return score == null ? "n/a" : Math.round(score);
+}
+
+function setLibrary(path) {
+  state.library = path;
+  state.librarySelected = true;
+  document.querySelector("#libraryPath").textContent = path;
+}
+
+function showChooseFolderPrompt() {
+  grid.innerHTML = "";
+  loadMore.hidden = true;
+  summary.textContent = "Choose a folder to start scanning photos.";
+}
+
+function renderFolderButton(item) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.textContent = item.name;
+  button.title = item.path;
+  button.addEventListener("click", () => loadFolder(item.path));
+  return button;
+}
+
+function renderFolderBrowser(payload) {
+  state.browsePath = payload.path;
+  state.browseParent = payload.parent;
+  folderPath.textContent = payload.path;
+  folderUpBtn.disabled = !payload.parent;
+  folderShortcuts.replaceChildren(...payload.shortcuts.map(renderFolderButton));
+  const fragment = document.createDocumentFragment();
+  payload.directories.forEach((directory) => {
+    const button = renderFolderButton(directory);
+    button.classList.add("folderItem");
+    fragment.appendChild(button);
+  });
+  folderList.replaceChildren(fragment);
+  if (!payload.directories.length) {
+    const empty = document.createElement("div");
+    empty.className = "emptyFolder";
+    empty.textContent = "No subfolders";
+    folderList.appendChild(empty);
+  }
+}
+
+async function loadFolder(path = state.library) {
+  const params = new URLSearchParams();
+  if (path) params.set("path", path);
+  const payload = await api(`/api/browse?${params}`);
+  renderFolderBrowser(payload);
 }
 
 function applyZoom() {
@@ -432,7 +493,27 @@ async function pollScan() {
 
 scanBtn.addEventListener("click", async () => {
   summary.textContent = "Starting scan...";
-  await api("/api/scan", { method: "POST", body: "{}" });
+  await api("/api/scan", { method: "POST", body: JSON.stringify({ library: state.library }) });
+  await pollScan();
+});
+
+
+chooseFolderBtn.addEventListener("click", async () => {
+  await loadFolder(state.library);
+  folderDialog.showModal();
+});
+
+folderUpBtn.addEventListener("click", async () => {
+  if (!state.browseParent) return;
+  await loadFolder(state.browseParent);
+});
+
+useFolderBtn.addEventListener("click", async () => {
+  if (!state.browsePath) return;
+  setLibrary(state.browsePath);
+  folderDialog.close();
+  summary.textContent = "Starting scan...";
+  await api("/api/scan", { method: "POST", body: JSON.stringify({ library: state.library }) });
   await pollScan();
 });
 
@@ -657,7 +738,13 @@ document.addEventListener("keydown", async (event) => {
 
 async function init() {
   const config = await api("/api/config");
+  state.library = config.library;
+  state.librarySelected = Boolean(config.librarySelected);
   document.querySelector("#libraryPath").textContent = config.library;
+  if (!state.librarySelected) {
+    showChooseFolderPrompt();
+    return;
+  }
   const job = await api("/api/scan-status");
   if (job.running) {
     await pollScan();
