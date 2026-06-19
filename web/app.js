@@ -472,7 +472,6 @@ document.querySelectorAll("[data-mark]").forEach((button) => {
 
 document.querySelector("#zoomOut").addEventListener("click", () => setZoom(zoomState.scale / 1.25));
 document.querySelector("#zoomFit").addEventListener("click", fitZoom);
-document.querySelector("#zoomActual").addEventListener("click", actualSizeZoom);
 document.querySelector("#zoomIn").addEventListener("click", () => setZoom(zoomState.scale * 1.25));
 
 viewerImg.addEventListener("load", async () => {

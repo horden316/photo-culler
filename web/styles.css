@@ -194,6 +194,13 @@ main {
   color: #ffffff;
 }
 
+.sourceBadge {
+  flex: 0 0 auto;
+  min-width: 112px;
+  text-align: center;
+  white-space: nowrap;
+}
+
 .card.keep .status {
   background: #226d58;
   color: #ffffff;
@@ -275,14 +282,28 @@ dialog::backdrop {
   display: flex;
   gap: 14px;
   justify-content: space-between;
+  min-width: 0;
   padding: 12px;
+}
+
+#viewerName,
+#viewerMeta {
+  flex: 0 1 auto;
+  min-width: 0;
 }
 
 .exposureInfo {
   color: #4e4a43;
   flex: 1 1 auto;
   font-size: 13px;
-  min-width: 180px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.viewerActions {
+  flex: 0 0 auto;
 }
 
 @media (max-width: 720px) {
