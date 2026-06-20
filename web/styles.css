@@ -365,7 +365,7 @@ dialog::backdrop {
   align-items: center;
   display: grid;
   gap: 14px;
-  grid-template-columns: minmax(180px, 0.7fr) minmax(320px, 1.4fr) auto;
+  grid-template-columns: minmax(220px, 0.8fr) minmax(300px, 1.3fr) auto;
   min-width: 0;
   padding: 12px;
 }
@@ -389,9 +389,16 @@ dialog::backdrop {
   font-weight: 650;
 }
 
+.viewerToolStatus {
+  color: #706b63;
+  font-size: 12px;
+  line-height: 1.25;
+  min-width: 0;
+}
+
 .viewerDetails {
   display: grid;
-  gap: 7px;
+  gap: 6px;
   min-width: 0;
 }
 
@@ -400,12 +407,6 @@ dialog::backdrop {
   display: flex;
   flex-wrap: wrap;
   gap: 6px 10px;
-  min-width: 0;
-}
-
-#viewerMeta {
-  color: #202124;
-  font-size: 14px;
   min-width: 0;
 }
 
