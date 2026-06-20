@@ -8,6 +8,9 @@ Local-first photo culling MVP for HEIF/HIF + RAW workflows.
 - Python 3 with Pillow installed:
   - pip: `python3 -m pip install Pillow`
   - conda: `conda install pillow`
+- Optional but recommended: NumPy for faster focus scoring:
+  - pip: `python3 -m pip install numpy`
+  - conda: `conda install numpy`
   - HIF/HEIF support depends on the Python environment and native image libraries. If your Pillow build cannot read HIF metadata, install `exiftool` below; Photo Culler will use it as a fallback.
 - Optional: `exiftool` for camera-brand-specific metadata badges, such as Fujifilm DR and film simulation.
   - macOS: `brew install exiftool`
@@ -34,6 +37,7 @@ http://127.0.0.1:8765
 - Pairs each display image with matching RAW files by stem (`.raf`, `.arw`, `.cr2`, `.cr3`, `.nef`, `.dng`, `.rw2`, `.orf`).
 - Detects orphan RAW files that do not have matching display images.
 - Generates JPEG thumbnails with macOS `sips`.
+- Estimates a 0-100 focus score from the sharpest local image regions.
 - Reads common EXIF fields for the viewer.
 - Shows camera-brand-specific badges when `exiftool` is installed.
 - Stores culling state in SQLite.

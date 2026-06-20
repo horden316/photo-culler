@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import shutil
 import sqlite3
@@ -19,11 +20,14 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 try:
-    from PIL import Image, ImageFilter, ImageStat
+    from PIL import Image
 except Exception:  # pragma: no cover
     Image = None
-    ImageFilter = None
-    ImageStat = None
+
+try:
+    import numpy as np
+except Exception:  # pragma: no cover
+    np = None
 
 
 DISPLAY_EXTS = {".hif", ".heif", ".heic", ".jpg", ".jpeg"}
@@ -55,6 +59,7 @@ SCAN_JOB = {
 }
 SCAN_LOCK = threading.Lock()
 DEFAULT_WORKERS = 8
+FOCUS_RISK_THRESHOLD = 45
 
 
 def default_library() -> Path:
@@ -331,15 +336,118 @@ def ensure_full_preview(path: Path, pid: str) -> Path | None:
         return None
 
 
-def estimate_blur_score(thumb: Path | None) -> float | None:
+def resize_for_focus_analysis(image):
+    longest_edge = 768 if np is not None else 384
+    width, height = image.size
+    scale = longest_edge / max(width, height)
+    if scale >= 1:
+        return image
+    resized = (max(1, round(width * scale)), max(1, round(height * scale)))
+    resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS", 1)
+    return image.resize(resized, resampling)
+
+
+def normalize_focus_score(raw_gradient: float) -> float:
+    if raw_gradient <= 0:
+        return 0.0
+    return round(min(100.0, 100.0 * raw_gradient / (raw_gradient + 35.0)), 2)
+
+
+def top_block_focus_score(block_scores: list[float]) -> float | None:
+    if not block_scores:
+        return None
+    block_scores.sort(reverse=True)
+    keep = max(1, math.ceil(len(block_scores) * 0.2))
+    return normalize_focus_score(sum(block_scores[:keep]) / keep)
+
+
+def tenengrad_score_numpy(gray) -> float | None:
+    arr = np.asarray(gray, dtype=np.float32)
+    if arr.shape[0] < 16 or arr.shape[1] < 16:
+        return None
+
+    gx = (
+        arr[:-2, 2:]
+        + 2 * arr[1:-1, 2:]
+        + arr[2:, 2:]
+        - arr[:-2, :-2]
+        - 2 * arr[1:-1, :-2]
+        - arr[2:, :-2]
+    )
+    gy = (
+        arr[2:, :-2]
+        + 2 * arr[2:, 1:-1]
+        + arr[2:, 2:]
+        - arr[:-2, :-2]
+        - 2 * arr[:-2, 1:-1]
+        - arr[:-2, 2:]
+    )
+    gradient = np.sqrt(gx * gx + gy * gy)
+
+    rows, cols = gradient.shape
+    grid = 6
+    block_h = max(1, rows // grid)
+    block_w = max(1, cols // grid)
+    block_scores: list[float] = []
+    for y in range(0, rows - block_h + 1, block_h):
+        for x in range(0, cols - block_w + 1, block_w):
+            block = gradient[y : y + block_h, x : x + block_w]
+            if block.size:
+                block_scores.append(float(np.percentile(block, 90)))
+    return top_block_focus_score(block_scores)
+
+
+def tenengrad_score_python(gray) -> float | None:
+    width, height = gray.size
+    if width < 16 or height < 16:
+        return None
+    pixels = gray.load()
+    grid = 6
+    block_w = max(1, (width - 2) // grid)
+    block_h = max(1, (height - 2) // grid)
+    blocks: list[list[float]] = [[] for _ in range(grid * grid)]
+
+    for y in range(1, height - 1):
+        by = min(grid - 1, (y - 1) // block_h)
+        for x in range(1, width - 1):
+            bx = min(grid - 1, (x - 1) // block_w)
+            gx = (
+                pixels[x + 1, y - 1]
+                + 2 * pixels[x + 1, y]
+                + pixels[x + 1, y + 1]
+                - pixels[x - 1, y - 1]
+                - 2 * pixels[x - 1, y]
+                - pixels[x - 1, y + 1]
+            )
+            gy = (
+                pixels[x - 1, y + 1]
+                + 2 * pixels[x, y + 1]
+                + pixels[x + 1, y + 1]
+                - pixels[x - 1, y - 1]
+                - 2 * pixels[x, y - 1]
+                - pixels[x + 1, y - 1]
+            )
+            blocks[by * grid + bx].append(math.hypot(gx, gy))
+
+    block_scores: list[float] = []
+    for values in blocks:
+        if not values:
+            continue
+        values.sort()
+        index = min(len(values) - 1, math.floor(len(values) * 0.9))
+        block_scores.append(values[index])
+    return top_block_focus_score(block_scores)
+
+
+def estimate_focus_score(thumb: Path | None) -> float | None:
     if not thumb or Image is None:
         return None
     try:
         with Image.open(thumb) as image:
-            gray = image.convert("L").resize((320, 320))
-            edges = gray.filter(ImageFilter.FIND_EDGES)
-            stat = ImageStat.Stat(edges)
-            return round(float(stat.var[0]), 2)
+            gray = resize_for_focus_analysis(image.convert("L"))
+            if np is not None:
+                return tenengrad_score_numpy(gray)
+            return tenengrad_score_python(gray)
     except Exception:
         return None
 
@@ -574,10 +682,10 @@ def extract_exif(path: Path) -> dict:
     }
 
 
-def warnings_for(blur_score: float | None, raw_path: Path | None) -> list[str]:
+def warnings_for(focus_score: float | None, raw_path: Path | None) -> list[str]:
     warnings: list[str] = []
-    if blur_score is not None and blur_score < 180:
-        warnings.append("soft")
+    if focus_score is not None and focus_score < FOCUS_RISK_THRESHOLD:
+        warnings.append("focus_risk")
     if raw_path is None:
         warnings.append("no_raw_pair")
     return warnings
@@ -586,7 +694,7 @@ def warnings_for(blur_score: float | None, raw_path: Path | None) -> list[str]:
 def process_photo(path: Path, raw_path: Path | None) -> dict:
     pid = photo_id(path)
     thumb = ensure_thumbnail(path, pid)
-    blur = estimate_blur_score(thumb)
+    focus = estimate_focus_score(thumb)
     width = None
     height = None
     if thumb and Image is not None:
@@ -596,7 +704,7 @@ def process_photo(path: Path, raw_path: Path | None) -> dict:
         except Exception:
             pass
     created_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(path.stat().st_mtime))
-    warnings = warnings_for(blur, raw_path)
+    warnings = warnings_for(focus, raw_path)
     return {
         "id": pid,
         "path": str(path),
@@ -607,7 +715,7 @@ def process_photo(path: Path, raw_path: Path | None) -> dict:
         "width": width,
         "height": height,
         "created_at": created_at,
-        "blur_score": blur,
+        "blur_score": focus,
         "metadata_json": json.dumps(extract_exif(path)),
         "warnings": json.dumps(warnings),
         "updated_at": time.time(),
@@ -742,14 +850,16 @@ def scan_library(library: Path, workers: int = DEFAULT_WORKERS) -> dict:
     update_scan_job(done=len(display_files), message="Finalizing")
     total = db.execute("SELECT COUNT(*) AS count FROM photos").fetchone()["count"]
     paired = db.execute("SELECT COUNT(*) AS count FROM photos WHERE raw_path IS NOT NULL").fetchone()["count"]
-    soft = db.execute("SELECT COUNT(*) AS count FROM photos WHERE warnings LIKE '%soft%'").fetchone()["count"]
+    focus_risk = db.execute(
+        "SELECT COUNT(*) AS count FROM photos WHERE warnings LIKE '%focus_risk%' OR warnings LIKE '%soft%'"
+    ).fetchone()["count"]
     orphan_count = db.execute("SELECT COUNT(*) AS count FROM orphan_raws").fetchone()["count"]
     db.close()
     result = {
         "scanned": len(display_files),
         "total": total,
         "paired": paired,
-        "soft": soft,
+        "focusRisk": focus_risk,
         "orphanRaws": orphan_count,
         "seconds": round(time.time() - started, 2),
     }
@@ -813,6 +923,7 @@ def row_to_photo(row: sqlite3.Row) -> dict:
         "width": row["width"],
         "height": row["height"],
         "createdAt": row["created_at"],
+        "focusScore": row["blur_score"],
         "blurScore": row["blur_score"],
         "metadata": metadata,
         "status": row["status"],
@@ -912,8 +1023,12 @@ def list_photos(query: dict) -> dict:
         clauses.append("status = ?")
         params.append(status)
     if warning:
-        clauses.append("warnings LIKE ?")
-        params.append(f"%{warning}%")
+        if warning == "focus_risk":
+            clauses.append("(warnings LIKE ? OR warnings LIKE ?)")
+            params.extend(["%focus_risk%", "%soft%"])
+        else:
+            clauses.append("warnings LIKE ?")
+            params.append(f"%{warning}%")
     if search:
         clauses.append("LOWER(stem) LIKE ?")
         params.append(f"%{search}%")

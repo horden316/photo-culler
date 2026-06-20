@@ -73,6 +73,20 @@ function formatScore(score) {
   return score == null ? "n/a" : Math.round(score);
 }
 
+function focusScore(photo) {
+  return photo.focusScore ?? photo.blurScore;
+}
+
+const WARNING_LABELS = {
+  focus_risk: "focus risk",
+  soft: "focus risk",
+  no_raw_pair: "no RAW pair",
+};
+
+function formatWarning(warning) {
+  return WARNING_LABELS[warning] || warning.replaceAll("_", " ");
+}
+
 function setLibrary(path) {
   state.library = path;
   state.librarySelected = true;
@@ -302,12 +316,12 @@ function renderCard(photo, index) {
       <div class="filename" title="${photo.path}">${photo.filename}</div>
       <div class="meta">
         <span class="status">${photo.status}</span>
-        <span class="badge">sharp ${formatScore(photo.blurScore)}</span>
+        <span class="badge">Focus ${formatScore(focusScore(photo))}</span>
         ${photo.rawPath ? `<span class="badge">RAW</span>` : ""}
       </div>
       <div class="badges">
         ${renderBrandBadges(photo.metadata)}
-        ${photo.warnings.map((warning) => `<span class="badge">${warning}</span>`).join("")}
+        ${photo.warnings.map((warning) => `<span class="badge">${formatWarning(warning)}</span>`).join("")}
       </div>
       <div class="mark">
         <button data-status="keep">Keep</button>
@@ -412,7 +426,7 @@ async function mark(id, status) {
 }
 
 function syncViewerStatus(photo) {
-  viewerMeta.textContent = `sharp ${formatScore(photo.blurScore)} · ${photo.rawPath ? "RAW paired" : "no RAW"}`;
+  viewerMeta.textContent = `Focus ${formatScore(focusScore(photo))} · ${photo.rawPath ? "RAW paired" : "no RAW pair"}`;
   document.querySelectorAll("[data-mark]").forEach((button) => {
     const isSelected = button.dataset.mark === photo.status;
     button.classList.toggle("selected", isSelected);
@@ -514,7 +528,7 @@ async function pollScan() {
       : job.error
         ? `Scan failed: ${job.error}`
         : job.result
-          ? `Scanned ${job.result.scanned} photos in ${job.result.seconds}s · paired ${job.result.paired} · soft ${job.result.soft} · orphan RAW ${job.result.orphanRaws || 0}`
+          ? `Scanned ${job.result.scanned} photos in ${job.result.seconds}s · paired ${job.result.paired} · focus risk ${job.result.focusRisk || 0} · orphan RAW ${job.result.orphanRaws || 0}`
           : job.message;
     if (!job.running) break;
     await new Promise((resolve) => setTimeout(resolve, 1000));
