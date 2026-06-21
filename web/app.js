@@ -247,6 +247,11 @@ function setViewerSource(label, mode) {
   viewerSource.className = `sourceBadge ${mode}`;
 }
 
+function isPointOutsideDialog(dialog, event) {
+  const rect = dialog.getBoundingClientRect();
+  return event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom;
+}
+
 function formatExposureInfo(metadata = {}) {
   const parts = [
     metadata.iso,
@@ -648,6 +653,36 @@ document.querySelectorAll("[data-mark]").forEach((button) => {
 document.querySelector("#zoomOut").addEventListener("click", () => setZoom(zoomState.scale / 1.25));
 document.querySelector("#zoomFit").addEventListener("click", fitZoom);
 document.querySelector("#zoomIn").addEventListener("click", () => setZoom(zoomState.scale * 1.25));
+
+const viewerDismissPointer = {
+  started: false,
+  target: null,
+  x: 0,
+  y: 0,
+};
+
+viewer.addEventListener("pointerdown", (event) => {
+  const target = event.target === viewer && isPointOutsideDialog(viewer, event) ? "backdrop" : null;
+  viewerDismissPointer.started = Boolean(target);
+  viewerDismissPointer.target = target;
+  viewerDismissPointer.x = event.clientX;
+  viewerDismissPointer.y = event.clientY;
+});
+
+viewer.addEventListener("pointerup", (event) => {
+  if (!viewerDismissPointer.started) return;
+  const target = viewerDismissPointer.target;
+  viewerDismissPointer.started = false;
+  viewerDismissPointer.target = null;
+  if (target === "backdrop" && event.target === viewer && isPointOutsideDialog(viewer, event)) {
+    viewer.close();
+  }
+});
+
+viewer.addEventListener("pointercancel", () => {
+  viewerDismissPointer.started = false;
+  viewerDismissPointer.target = null;
+});
 
 viewerImg.addEventListener("load", async () => {
   const token = viewerImg.dataset.loadToken;
