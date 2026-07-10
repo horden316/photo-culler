@@ -647,6 +647,11 @@ def find_exiftool() -> list[str] | None:
     return command
 
 
+# Keep console-less on Windows: without this every exiftool call flashes a
+# console window in windowed (PyInstaller --noconsole) builds.
+SUBPROCESS_FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
+
 def read_exiftool_tags(path: Path, tags: list[str]) -> dict:
     exiftool_cmd = find_exiftool()
     if not exiftool_cmd:
@@ -659,6 +664,7 @@ def read_exiftool_tags(path: Path, tags: list[str]) -> dict:
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             timeout=10,
+            creationflags=SUBPROCESS_FLAGS,
         )
     except Exception:
         return {}
