@@ -21,7 +21,7 @@ jobs:
           - os: macos-latest
             artifact: PhotoCuller-macos.zip
           - os: windows-latest
-            artifact: PhotoCuller-windows.zip
+            artifact: PhotoCuller-windows-portable.exe
           - os: ubuntu-latest
             artifact: PhotoCuller-linux.tar.gz
     runs-on: ${{ matrix.os }}
@@ -76,7 +76,7 @@ jobs:
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: bash
-        run: cd dist && 7z a "../${{ matrix.artifact }}" PhotoCuller
+        run: mv dist/PhotoCuller.exe "${{ matrix.artifact }}"
 
       - name: Package (Linux)
         if: runner.os == 'Linux'
