@@ -60,8 +60,8 @@ SCAN_JOB = {
 }
 SCAN_LOCK = threading.Lock()
 DEFAULT_WORKERS = 8
-FOCUS_ABS_FLOOR = 30.0
-FOCUS_SOFT_CAP = 55.0
+FOCUS_ABS_FLOOR = 42.0
+FOCUS_SOFT_CAP = 50.0
 FOCUS_MAD_MULTIPLIER = 2.0
 
 
@@ -345,7 +345,8 @@ FOCUS_REBLUR_TAPS = 9
 FOCUS_EDGE_MIN_GRAD = 4.0
 FOCUS_EDGE_COHERENCE = 2
 FOCUS_MIN_EDGE_PIXELS = 300
-FOCUS_POINT_WEIGHT = 0.6
+FOCUS_POINT_WEIGHT = 0.8
+FOCUS_COARSE_FACTOR = 3
 FOCUS_DIRECTIONS = ((0, 1), (1, 0), (1, 1), (1, -1))
 
 
@@ -462,8 +463,47 @@ def clamped_tile_origin(center_x: int, center_y: int, width: int, height: int) -
     return x0, y0
 
 
+def coarse_tile_at(gray, center_x: int, center_y: int):
+    """FOCUS_TILE-sized tile box-downsampled FOCUS_COARSE_FACTOR x around a point.
+
+    The coarse scale sees past in-camera sharpening halos (1-2px, gone after
+    downsampling) so wide motion smear that fools the native-scale metric
+    still reads as blurred here.
+    """
+    factor = FOCUS_COARSE_FACTOR
+    size = FOCUS_TILE * factor
+    height, width = gray.shape
+    x0 = min(max(0, center_x - size // 2), max(0, width - size))
+    y0 = min(max(0, center_y - size // 2), max(0, height - size))
+    region = gray[y0 : y0 + size, x0 : x0 + size].astype(np.float32)
+    rows = region.shape[0] // factor * factor
+    cols = region.shape[1] // factor * factor
+    if rows < factor or cols < factor:
+        return None
+    return region[:rows, :cols].reshape(rows // factor, factor, cols // factor, factor).mean(axis=(1, 3))
+
+
+def dual_scale_sharpness(gray, center_x: int, center_y: int, allow_coarse_only: bool) -> float | None:
+    """Sharpness at native scale corrected downward by the coarse scale.
+
+    Native-scale evidence is required for grid tiles: dark low-texture tiles
+    that only resolve at the coarse scale would otherwise report inflated
+    sharpness. The AF-point tile may fall back to coarse-only
+    (allow_coarse_only): structure that exists only at the coarse scale right
+    where the camera focused is itself evidence of blur.
+    """
+    height, width = gray.shape
+    x0, y0 = clamped_tile_origin(center_x, center_y, width, height)
+    fine = tile_sharpness(gray[y0 : y0 + FOCUS_TILE, x0 : x0 + FOCUS_TILE])
+    coarse_input = coarse_tile_at(gray, center_x, center_y)
+    coarse = tile_sharpness(coarse_input) if coarse_input is not None else None
+    if fine is None:
+        return coarse if allow_coarse_only else None
+    return min(fine, coarse) if coarse is not None else fine
+
+
 def analyze_focus(path: Path, focus_pixel: tuple[int, int] | None) -> dict | None:
-    """Grid + AF-point sharpness at native resolution.
+    """Grid + AF-point sharpness measured at native and 3x-coarse scale.
 
     Returns {"score", "sharpMax", "sharpFocus"} (score 0-100) or None when the
     image cannot be analyzed.
@@ -482,8 +522,7 @@ def analyze_focus(path: Path, focus_pixel: tuple[int, int] | None) -> dict | Non
         for col in range(FOCUS_GRID):
             cx = int(width * (2 * col + 1) / (2 * FOCUS_GRID))
             cy = int(height * (2 * row + 1) / (2 * FOCUS_GRID))
-            x0, y0 = clamped_tile_origin(cx, cy, width, height)
-            value = tile_sharpness(gray[y0 : y0 + FOCUS_TILE, x0 : x0 + FOCUS_TILE])
+            value = dual_scale_sharpness(gray, cx, cy, allow_coarse_only=False)
             if value is not None:
                 sharp_values.append(value)
 
@@ -491,8 +530,7 @@ def analyze_focus(path: Path, focus_pixel: tuple[int, int] | None) -> dict | Non
     if focus_pixel is not None:
         fx, fy = focus_pixel
         if 0 <= fx < width and 0 <= fy < height:
-            x0, y0 = clamped_tile_origin(fx, fy, width, height)
-            sharp_focus = tile_sharpness(gray[y0 : y0 + FOCUS_TILE, x0 : x0 + FOCUS_TILE])
+            sharp_focus = dual_scale_sharpness(gray, fx, fy, allow_coarse_only=True)
 
     if not sharp_values and sharp_focus is None:
         return None
