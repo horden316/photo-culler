@@ -1,6 +1,11 @@
 # Runtime/cache data
 data/
 
+# Build artifacts
+build/
+dist/
+vendor/
+
 # Python
 __pycache__/
 *.py[cod]

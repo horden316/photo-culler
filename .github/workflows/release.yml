@@ -1,0 +1,88 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  EXIFTOOL_VERSION: "13.59"
+  EXIFTOOL_PERL_SHA256: "668ea3acececb7235fbd0f4900e72d5f12c9b07e5c778fd36cb1e9b5828fd65a"
+  EXIFTOOL_WIN_SHA256: "44b512b25af500724ba579d0a53c8fc5851628b692dd5e5d94ae4a15c2cba9ec"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            artifact: PhotoCuller-macos.zip
+          - os: windows-latest
+            artifact: PhotoCuller-windows.zip
+          - os: ubuntu-latest
+            artifact: PhotoCuller-linux.tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Linux system dependencies (GTK/WebKit for pywebview)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgirepository1.0-dev libcairo2-dev pkg-config python3-dev gir1.2-webkit2-4.1
+          python -m pip install "pygobject<3.51"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: Bundle exiftool (perl distribution)
+        if: runner.os != 'Windows'
+        run: |
+          curl -L --retry 3 -o exiftool.tar.gz "https://sourceforge.net/projects/exiftool/files/Image-ExifTool-${EXIFTOOL_VERSION}.tar.gz/download"
+          echo "${EXIFTOOL_PERL_SHA256}  exiftool.tar.gz" | sha256sum -c -
+          tar xzf exiftool.tar.gz
+          mkdir -p vendor/exiftool
+          cp "Image-ExifTool-${EXIFTOOL_VERSION}/exiftool" vendor/exiftool/
+          cp -R "Image-ExifTool-${EXIFTOOL_VERSION}/lib" vendor/exiftool/
+          cp "Image-ExifTool-${EXIFTOOL_VERSION}/README" vendor/exiftool/
+
+      - name: Bundle exiftool (Windows executable)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          curl -L --retry 3 -o exiftool.zip "https://sourceforge.net/projects/exiftool/files/exiftool-${EXIFTOOL_VERSION}_64.zip/download"
+          echo "${EXIFTOOL_WIN_SHA256}  exiftool.zip" | sha256sum -c -
+          unzip -q exiftool.zip
+          mkdir -p vendor/exiftool
+          cp "exiftool-${EXIFTOOL_VERSION}_64/exiftool(-k).exe" vendor/exiftool/exiftool.exe
+          cp -R "exiftool-${EXIFTOOL_VERSION}_64/exiftool_files" vendor/exiftool/
+
+      - name: Build with PyInstaller
+        run: pyinstaller photo-culler.spec --noconfirm
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: ditto -c -k --sequesterRsrc --keepParent dist/PhotoCuller.app "${{ matrix.artifact }}"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: cd dist && 7z a "../${{ matrix.artifact }}" PhotoCuller
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: tar czf "${{ matrix.artifact }}" -C dist PhotoCuller
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.artifact }}

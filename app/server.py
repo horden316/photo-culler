@@ -10,7 +10,6 @@ import sqlite3
 import statistics
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import mimetypes
@@ -21,9 +20,17 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 try:
-    from PIL import Image
+    from PIL import Image, ImageOps
 except Exception:  # pragma: no cover
     Image = None
+    ImageOps = None
+
+try:
+    from pillow_heif import register_heif_opener
+
+    register_heif_opener()
+except Exception:  # pragma: no cover
+    pass
 
 try:
     import numpy as np
@@ -34,10 +41,15 @@ except Exception:  # pragma: no cover
 DISPLAY_EXTS = {".hif", ".heif", ".heic", ".jpg", ".jpeg"}
 RAW_EXTS = {".raf", ".arw", ".cr2", ".cr3", ".nef", ".dng", ".rw2", ".orf"}
 SKIP_DIRS = {"photo-culler", "_PHOTO_CULLER_REJECTED", "_PHOTO_CULLER_REVIEW", "_PHOTO_CULLER_ORPHAN_RAW"}
-ROOT = Path(__file__).resolve().parents[2]
-APP_ROOT = Path(__file__).resolve().parents[1]
+APP_ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[1]))
 WEB_ROOT = APP_ROOT / "web"
-DATA_ROOT = APP_ROOT / "data"
+LEGACY_DATA_ROOT = Path(__file__).resolve().parents[1] / "data"
+try:
+    import platformdirs
+
+    DATA_ROOT = Path(platformdirs.user_data_dir("PhotoCuller", appauthor=False))
+except Exception:  # pragma: no cover
+    DATA_ROOT = LEGACY_DATA_ROOT
 THUMB_ROOT = DATA_ROOT / "thumbs"
 FULL_ROOT = DATA_ROOT / "full"
 PREVIEW_ROOT = DATA_ROOT / "preview"
@@ -74,6 +86,10 @@ def connect() -> sqlite3.Connection:
     THUMB_ROOT.mkdir(parents=True, exist_ok=True)
     FULL_ROOT.mkdir(parents=True, exist_ok=True)
     PREVIEW_ROOT.mkdir(parents=True, exist_ok=True)
+    if not DB_PATH.exists():
+        legacy_db = LEGACY_DATA_ROOT / "catalog.sqlite3"
+        if legacy_db != DB_PATH and legacy_db.exists():
+            shutil.copy2(legacy_db, DB_PATH)
     db = sqlite3.connect(DB_PATH)
     db.row_factory = sqlite3.Row
     db.execute(
@@ -224,30 +240,6 @@ def scan_files(library: Path):
     return display_files, raw_by_key
 
 
-def run_sips_metadata(path: Path) -> dict:
-    try:
-        proc = subprocess.run(
-            ["sips", "-g", "pixelWidth", "-g", "pixelHeight", "-g", "creation", str(path)],
-            check=False,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            timeout=15,
-        )
-    except Exception:
-        return {}
-    result = {}
-    for line in proc.stdout.splitlines():
-        if ":" not in line:
-            continue
-        key, value = line.strip().split(":", 1)
-        key = key.strip()
-        value = value.strip()
-        if key in {"pixelWidth", "pixelHeight", "creation"}:
-            result[key] = value
-    return result
-
-
 def thumb_path_for(pid: str) -> Path:
     return THUMB_ROOT / f"{pid}.jpg"
 
@@ -276,67 +268,37 @@ def prune_cache(keep_ids: set[str]) -> int:
     return removed
 
 
-def ensure_thumbnail(path: Path, pid: str) -> Path | None:
-    out = thumb_path_for(pid)
+def render_cached_jpeg(path: Path, out: Path, max_edge: int | None) -> Path | None:
+    """Decode any supported image into a display-oriented cached JPEG."""
     if out.exists() and out.stat().st_mtime >= path.stat().st_mtime:
         return out
+    if Image is None:
+        return None
     tmp = out.with_suffix(".tmp.jpg")
     try:
         tmp.unlink(missing_ok=True)
-        subprocess.run(
-            ["sips", "-s", "format", "jpeg", "-Z", "900", str(path), "--out", str(tmp)],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=30,
-        )
+        with Image.open(path) as image:
+            image = ImageOps.exif_transpose(image)
+            if max_edge is not None:
+                image.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
+            image.convert("RGB").save(tmp, "JPEG", quality=85)
         tmp.replace(out)
         return out
     except Exception:
         tmp.unlink(missing_ok=True)
         return None
+
+
+def ensure_thumbnail(path: Path, pid: str) -> Path | None:
+    return render_cached_jpeg(path, thumb_path_for(pid), 900)
 
 
 def ensure_smooth_preview(path: Path, pid: str) -> Path | None:
-    out = preview_path_for(pid)
-    if out.exists() and out.stat().st_mtime >= path.stat().st_mtime:
-        return out
-    tmp = out.with_suffix(".tmp.jpg")
-    try:
-        tmp.unlink(missing_ok=True)
-        subprocess.run(
-            ["sips", "-s", "format", "jpeg", "-Z", "2400", str(path), "--out", str(tmp)],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=45,
-        )
-        tmp.replace(out)
-        return out
-    except Exception:
-        tmp.unlink(missing_ok=True)
-        return None
+    return render_cached_jpeg(path, preview_path_for(pid), 2400)
 
 
 def ensure_full_preview(path: Path, pid: str) -> Path | None:
-    out = full_path_for(pid)
-    if out.exists() and out.stat().st_mtime >= path.stat().st_mtime:
-        return out
-    tmp = out.with_suffix(".tmp.jpg")
-    try:
-        tmp.unlink(missing_ok=True)
-        subprocess.run(
-            ["sips", "-s", "format", "jpeg", str(path), "--out", str(tmp)],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=60,
-        )
-        tmp.replace(out)
-        return out
-    except Exception:
-        tmp.unlink(missing_ok=True)
-        return None
+    return render_cached_jpeg(path, full_path_for(pid), None)
 
 
 FOCUS_TILE = 512
@@ -430,29 +392,37 @@ def tile_sharpness(tile_u8) -> float | None:
     return max(0.0, min(1.0, 1.0 - worst_blur))
 
 
+def undo_exif_orientation(gray, orientation: int):
+    """Map display-oriented pixels back to sensor orientation."""
+    if orientation == 2:
+        return np.fliplr(gray)
+    if orientation == 3:
+        return np.rot90(gray, 2)
+    if orientation == 4:
+        return np.flipud(gray)
+    if orientation == 5:
+        return gray.T
+    if orientation == 6:
+        return np.rot90(gray, 1)
+    if orientation == 7:
+        return np.rot90(gray, 2).T
+    if orientation == 8:
+        return np.rot90(gray, -1)
+    return gray
+
+
 def decode_full_gray(path: Path):
-    """Full-resolution grayscale pixels; HIF/HEIC decoded through sips."""
-    ext = path.suffix.lower()
+    """Full-resolution grayscale pixels in sensor orientation.
+
+    FocusPixel AF coordinates are relative to the unrotated sensor frame, so
+    rotation that pillow-heif applies on decode is undone here. Plain JPEGs
+    are never auto-rotated by Pillow and need no correction.
+    """
     try:
-        if ext in {".jpg", ".jpeg"}:
-            with Image.open(path) as image:
-                return np.asarray(image.convert("L"), dtype=np.uint8)
-        DATA_ROOT.mkdir(parents=True, exist_ok=True)
-        fd, tmp_name = tempfile.mkstemp(suffix=".jpg", dir=DATA_ROOT)
-        os.close(fd)
-        tmp = Path(tmp_name)
-        try:
-            subprocess.run(
-                ["sips", "-s", "format", "jpeg", str(path), "--out", str(tmp)],
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=60,
-            )
-            with Image.open(tmp) as image:
-                return np.asarray(image.convert("L"), dtype=np.uint8)
-        finally:
-            tmp.unlink(missing_ok=True)
+        with Image.open(path) as image:
+            orientation = image.info.get("original_orientation") or 1
+            gray = np.asarray(image.convert("L"), dtype=np.uint8)
+        return np.ascontiguousarray(undo_exif_orientation(gray, orientation))
     except Exception:
         return None
 
@@ -651,12 +621,39 @@ def fuji_brand_badges(tags: dict) -> list[str]:
     return badges
 
 
+_EXIFTOOL_CMD: list[str] | None = None
+_EXIFTOOL_RESOLVED = False
+
+
+def find_exiftool() -> list[str] | None:
+    """Command to invoke exiftool: the bundled copy first, then a system install."""
+    global _EXIFTOOL_CMD, _EXIFTOOL_RESOLVED
+    if _EXIFTOOL_RESOLVED:
+        return _EXIFTOOL_CMD
+    command = None
+    if sys.platform == "win32":
+        bundled = APP_ROOT / "exiftool" / "exiftool.exe"
+        if bundled.exists():
+            command = [str(bundled)]
+    else:
+        bundled = APP_ROOT / "exiftool" / "exiftool"
+        if bundled.exists() and shutil.which("perl"):
+            command = ["perl", str(bundled)]
+    if command is None:
+        system = shutil.which("exiftool")
+        command = [system] if system else None
+    _EXIFTOOL_CMD = command
+    _EXIFTOOL_RESOLVED = True
+    return command
+
+
 def read_exiftool_tags(path: Path, tags: list[str]) -> dict:
-    if not shutil.which("exiftool"):
+    exiftool_cmd = find_exiftool()
+    if not exiftool_cmd:
         return {}
     try:
         proc = subprocess.run(
-            ["exiftool", "-json", *tags, str(path)],
+            [*exiftool_cmd, "-json", *tags, str(path)],
             check=False,
             text=True,
             stdout=subprocess.PIPE,
@@ -764,14 +761,20 @@ def extract_exif(path: Path) -> dict:
             with Image.open(path) as image:
                 exif = image.getexif()
         elif ext in {".hif", ".heif", ".heic"}:
-            data = path.read_bytes()
-            tiff_index = data.find(b"II*\x00")
-            if tiff_index == -1:
-                tiff_index = data.find(b"MM\x00*")
-            if tiff_index == -1:
-                return exiftool_metadata
-            exif = Image.Exif()
-            exif.load(data[tiff_index:])
+            try:
+                with Image.open(path) as image:
+                    exif = image.getexif()
+            except Exception:
+                exif = None
+            if not exif:
+                data = path.read_bytes()
+                tiff_index = data.find(b"II*\x00")
+                if tiff_index == -1:
+                    tiff_index = data.find(b"MM\x00*")
+                if tiff_index == -1:
+                    return exiftool_metadata
+                exif = Image.Exif()
+                exif.load(data[tiff_index:])
     except Exception:
         return exiftool_metadata
     if not exif:
