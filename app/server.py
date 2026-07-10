@@ -4,12 +4,13 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import math
 import os
 import shutil
 import sqlite3
+import statistics
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import mimetypes
@@ -59,7 +60,9 @@ SCAN_JOB = {
 }
 SCAN_LOCK = threading.Lock()
 DEFAULT_WORKERS = 8
-FOCUS_RISK_THRESHOLD = 45
+FOCUS_ABS_FLOOR = 30.0
+FOCUS_SOFT_CAP = 55.0
+FOCUS_MAD_MULTIPLIER = 2.0
 
 
 def default_library() -> Path:
@@ -336,120 +339,174 @@ def ensure_full_preview(path: Path, pid: str) -> Path | None:
         return None
 
 
-def resize_for_focus_analysis(image):
-    longest_edge = 768 if np is not None else 384
-    width, height = image.size
-    scale = longest_edge / max(width, height)
-    if scale >= 1:
-        return image
-    resized = (max(1, round(width * scale)), max(1, round(height * scale)))
-    resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS", 1)
-    return image.resize(resized, resampling)
+FOCUS_TILE = 512
+FOCUS_GRID = 3
+FOCUS_REBLUR_TAPS = 9
+FOCUS_EDGE_MIN_GRAD = 4.0
+FOCUS_EDGE_COHERENCE = 2
+FOCUS_MIN_EDGE_PIXELS = 300
+FOCUS_POINT_WEIGHT = 0.6
+FOCUS_DIRECTIONS = ((0, 1), (1, 0), (1, 1), (1, -1))
 
 
-def normalize_focus_score(raw_gradient: float) -> float:
-    if raw_gradient <= 0:
-        return 0.0
-    return round(min(100.0, 100.0 * raw_gradient / (raw_gradient + 35.0)), 2)
-
-
-def top_block_focus_score(block_scores: list[float]) -> float | None:
-    if not block_scores:
-        return None
-    block_scores.sort(reverse=True)
-    keep = max(1, math.ceil(len(block_scores) * 0.2))
-    return normalize_focus_score(sum(block_scores[:keep]) / keep)
-
-
-def tenengrad_score_numpy(gray) -> float | None:
-    arr = np.asarray(gray, dtype=np.float32)
-    if arr.shape[0] < 16 or arr.shape[1] < 16:
-        return None
-
-    gx = (
-        arr[:-2, 2:]
-        + 2 * arr[1:-1, 2:]
-        + arr[2:, 2:]
-        - arr[:-2, :-2]
-        - 2 * arr[1:-1, :-2]
-        - arr[2:, :-2]
+def median_filter_3x3(arr):
+    padded = np.pad(arr, 1, mode="edge")
+    stacked = np.stack(
+        [padded[y : y + arr.shape[0], x : x + arr.shape[1]] for y in range(3) for x in range(3)]
     )
-    gy = (
-        arr[2:, :-2]
-        + 2 * arr[2:, 1:-1]
-        + arr[2:, 2:]
-        - arr[:-2, :-2]
-        - 2 * arr[:-2, 1:-1]
-        - arr[:-2, 2:]
-    )
-    gradient = np.sqrt(gx * gx + gy * gy)
-
-    rows, cols = gradient.shape
-    grid = 6
-    block_h = max(1, rows // grid)
-    block_w = max(1, cols // grid)
-    block_scores: list[float] = []
-    for y in range(0, rows - block_h + 1, block_h):
-        for x in range(0, cols - block_w + 1, block_w):
-            block = gradient[y : y + block_h, x : x + block_w]
-            if block.size:
-                block_scores.append(float(np.percentile(block, 90)))
-    return top_block_focus_score(block_scores)
+    return np.median(stacked, axis=0)
 
 
-def tenengrad_score_python(gray) -> float | None:
-    width, height = gray.size
-    if width < 16 or height < 16:
+def shifted_overlap(arr, dy: int, dx: int, steps: int):
+    """View of arr shifted `steps` pixels along direction (dy, dx), aligned to origin."""
+    rows, cols = arr.shape
+    y0, x0 = max(0, dy * steps), max(0, dx * steps)
+    y1, x1 = rows + min(0, dy * steps), cols + min(0, dx * steps)
+    return arr[y0:y1, x0:x1]
+
+
+def directional_blur_extent(tile, dy: int, dx: int) -> float | None:
+    """Re-blur metric along one direction, measured at edge pixels only.
+
+    Re-blurs the tile with a 1-D mean filter along (dy, dx) and averages the
+    per-pixel gradient-loss ratio: crisp edges lose most of their gradient,
+    already-soft edges barely change. The unweighted per-pixel average keeps a
+    few oversharpened halo pixels from outvoting large soft areas.
+
+    At native resolution most pixel differences are sensor noise, so pixels
+    below the noise floor are excluded, as are isolated ones — real edges form
+    contiguous lines while noise spikes stand alone. Returns blur extent 0..1
+    (1 = fully blurred), or None with too few edge pixels to measure.
+    """
+    half = FOCUS_REBLUR_TAPS // 2
+    rows, cols = tile.shape
+    pad_y, pad_x = abs(dy) * half, abs(dx) * half
+    padded = np.pad(tile, ((pad_y, pad_y), (pad_x, pad_x)), mode="edge")
+    acc = np.zeros((rows, cols), dtype=np.float64)
+    for step in range(-half, half + 1):
+        acc += padded[pad_y + dy * step : pad_y + dy * step + rows, pad_x + dx * step : pad_x + dx * step + cols]
+    blurred = acc / FOCUS_REBLUR_TAPS
+
+    def central_gradient(arr):
+        return np.abs(shifted_overlap(arr, dy, dx, 1) - shifted_overlap(arr, -dy, -dx, 1)) / 2
+
+    grad = central_gradient(tile)
+    grad_blurred = central_gradient(blurred)
+    mask = grad >= FOCUS_EDGE_MIN_GRAD
+    mask_u8 = mask.astype(np.uint8)
+    m_rows, m_cols = mask_u8.shape
+    padded_mask = np.pad(mask_u8, 1)
+    neighbours = np.zeros((m_rows, m_cols), dtype=np.int16)
+    for ny in (-1, 0, 1):
+        for nx in (-1, 0, 1):
+            if ny or nx:
+                neighbours += padded_mask[1 + ny : 1 + ny + m_rows, 1 + nx : 1 + nx + m_cols]
+    mask &= neighbours >= FOCUS_EDGE_COHERENCE
+    if int(mask.sum()) < FOCUS_MIN_EDGE_PIXELS:
         return None
-    pixels = gray.load()
-    grid = 6
-    block_w = max(1, (width - 2) // grid)
-    block_h = max(1, (height - 2) // grid)
-    blocks: list[list[float]] = [[] for _ in range(grid * grid)]
+    edge_grad = grad[mask]
+    loss = np.clip(edge_grad - grad_blurred[mask], 0, None)
+    return 1.0 - float((loss / edge_grad).mean())
 
-    for y in range(1, height - 1):
-        by = min(grid - 1, (y - 1) // block_h)
-        for x in range(1, width - 1):
-            bx = min(grid - 1, (x - 1) // block_w)
-            gx = (
-                pixels[x + 1, y - 1]
-                + 2 * pixels[x + 1, y]
-                + pixels[x + 1, y + 1]
-                - pixels[x - 1, y - 1]
-                - 2 * pixels[x - 1, y]
-                - pixels[x - 1, y + 1]
-            )
-            gy = (
-                pixels[x - 1, y + 1]
-                + 2 * pixels[x, y + 1]
-                + pixels[x + 1, y + 1]
-                - pixels[x - 1, y - 1]
-                - 2 * pixels[x, y - 1]
-                - pixels[x + 1, y - 1]
-            )
-            blocks[by * grid + bx].append(math.hypot(gx, gy))
 
-    block_scores: list[float] = []
-    for values in blocks:
-        if not values:
+def tile_sharpness(tile_u8) -> float | None:
+    """Sharpness 0..1 for one tile; None when the tile lacks usable edges.
+
+    Measures along four directions (axes + diagonals) and keeps the blurriest:
+    motion smear leaves thin streaks that stay crisp across the motion axis but
+    are smooth along it, so a single direction cannot expose it.
+    """
+    tile = median_filter_3x3(tile_u8.astype(np.float32))
+    worst_blur = None
+    for dy, dx in FOCUS_DIRECTIONS:
+        blur_extent = directional_blur_extent(tile, dy, dx)
+        if blur_extent is None:
             continue
-        values.sort()
-        index = min(len(values) - 1, math.floor(len(values) * 0.9))
-        block_scores.append(values[index])
-    return top_block_focus_score(block_scores)
-
-
-def estimate_focus_score(thumb: Path | None) -> float | None:
-    if not thumb or Image is None:
+        if worst_blur is None or blur_extent > worst_blur:
+            worst_blur = blur_extent
+    if worst_blur is None:
         return None
+    return max(0.0, min(1.0, 1.0 - worst_blur))
+
+
+def decode_full_gray(path: Path):
+    """Full-resolution grayscale pixels; HIF/HEIC decoded through sips."""
+    ext = path.suffix.lower()
     try:
-        with Image.open(thumb) as image:
-            gray = resize_for_focus_analysis(image.convert("L"))
-            if np is not None:
-                return tenengrad_score_numpy(gray)
-            return tenengrad_score_python(gray)
+        if ext in {".jpg", ".jpeg"}:
+            with Image.open(path) as image:
+                return np.asarray(image.convert("L"), dtype=np.uint8)
+        DATA_ROOT.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(suffix=".jpg", dir=DATA_ROOT)
+        os.close(fd)
+        tmp = Path(tmp_name)
+        try:
+            subprocess.run(
+                ["sips", "-s", "format", "jpeg", str(path), "--out", str(tmp)],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=60,
+            )
+            with Image.open(tmp) as image:
+                return np.asarray(image.convert("L"), dtype=np.uint8)
+        finally:
+            tmp.unlink(missing_ok=True)
     except Exception:
         return None
+
+
+def clamped_tile_origin(center_x: int, center_y: int, width: int, height: int) -> tuple[int, int]:
+    x0 = min(max(0, center_x - FOCUS_TILE // 2), max(0, width - FOCUS_TILE))
+    y0 = min(max(0, center_y - FOCUS_TILE // 2), max(0, height - FOCUS_TILE))
+    return x0, y0
+
+
+def analyze_focus(path: Path, focus_pixel: tuple[int, int] | None) -> dict | None:
+    """Grid + AF-point sharpness at native resolution.
+
+    Returns {"score", "sharpMax", "sharpFocus"} (score 0-100) or None when the
+    image cannot be analyzed.
+    """
+    if Image is None or np is None:
+        return None
+    gray = decode_full_gray(path)
+    if gray is None:
+        return None
+    height, width = gray.shape
+    if height < FOCUS_TILE or width < FOCUS_TILE:
+        return None
+
+    sharp_values: list[float] = []
+    for row in range(FOCUS_GRID):
+        for col in range(FOCUS_GRID):
+            cx = int(width * (2 * col + 1) / (2 * FOCUS_GRID))
+            cy = int(height * (2 * row + 1) / (2 * FOCUS_GRID))
+            x0, y0 = clamped_tile_origin(cx, cy, width, height)
+            value = tile_sharpness(gray[y0 : y0 + FOCUS_TILE, x0 : x0 + FOCUS_TILE])
+            if value is not None:
+                sharp_values.append(value)
+
+    sharp_focus = None
+    if focus_pixel is not None:
+        fx, fy = focus_pixel
+        if 0 <= fx < width and 0 <= fy < height:
+            x0, y0 = clamped_tile_origin(fx, fy, width, height)
+            sharp_focus = tile_sharpness(gray[y0 : y0 + FOCUS_TILE, x0 : x0 + FOCUS_TILE])
+
+    if not sharp_values and sharp_focus is None:
+        return None
+    sharp_max = max(sharp_values) if sharp_values else sharp_focus
+    if sharp_focus is not None:
+        sharp_max = max(sharp_max, sharp_focus)
+        combined = FOCUS_POINT_WEIGHT * sharp_focus + (1 - FOCUS_POINT_WEIGHT) * sharp_max
+    else:
+        combined = sharp_max
+    return {
+        "score": round(100.0 * combined, 2),
+        "sharpMax": round(100.0 * sharp_max, 2),
+        "sharpFocus": round(100.0 * sharp_focus, 2) if sharp_focus is not None else None,
+    }
 
 
 def as_float(value) -> float | None:
@@ -581,42 +638,59 @@ def read_exiftool_tags(path: Path, tags: list[str]) -> dict:
     return payload[0]
 
 
-def extract_brand_badges(path: Path) -> list[str]:
-    tags = read_exiftool_tags(
-        path,
-        [
-            "-Make",
-            "-DynamicRange",
-            "-DynamicRangeSetting",
-            "-DevelopmentDynamicRange",
-            "-FilmMode",
-            "-FilmSimulation",
-            "-WhiteBalance",
-            "-ColorChromeEffect",
-            "-ColorChromeFXBlue",
-        ],
-    )
-    if not tags:
-        return []
-    make = compact_badge(tags.get("Make")) or ""
-    if "fujifilm" in make.lower():
-        return fuji_brand_badges(tags)
-    return []
+EXIFTOOL_TAGS = [
+    "-Make",
+    "-DynamicRange",
+    "-DynamicRangeSetting",
+    "-DevelopmentDynamicRange",
+    "-FilmMode",
+    "-FilmSimulation",
+    "-WhiteBalance",
+    "-ColorChromeEffect",
+    "-ColorChromeFXBlue",
+    "-ISO",
+    "-FNumber",
+    "-ExposureTime",
+    "-FocalLength",
+    "-ExposureCompensation",
+    "-DateTimeOriginal",
+    "-CreateDate",
+    "-FocusWarning",
+    "-BlurWarning",
+    "-ExposureWarning",
+    "-FocusPixel",
+]
+
+
+def parse_focus_pixel(value) -> list[int] | None:
+    text = compact_badge(value)
+    if not text:
+        return None
+    parts = text.replace(",", " ").split()
+    if len(parts) < 2:
+        return None
+    try:
+        return [int(float(parts[0])), int(float(parts[1]))]
+    except ValueError:
+        return None
+
+
+def camera_warning_flags(tags: dict) -> list[str]:
+    flags: list[str] = []
+    focus = compact_badge(tags.get("FocusWarning"))
+    if focus and focus.lower() != "good":
+        flags.append("camera_focus")
+    blur = compact_badge(tags.get("BlurWarning"))
+    if blur and blur.lower() not in {"none", "good"}:
+        flags.append("camera_blur")
+    exposure = compact_badge(tags.get("ExposureWarning"))
+    if exposure and exposure.lower() != "good":
+        flags.append("camera_exposure")
+    return flags
 
 
 def extract_exiftool_metadata(path: Path) -> dict:
-    tags = read_exiftool_tags(
-        path,
-        [
-            "-ISO",
-            "-FNumber",
-            "-ExposureTime",
-            "-FocalLength",
-            "-ExposureCompensation",
-            "-DateTimeOriginal",
-            "-CreateDate",
-        ],
-    )
+    tags = read_exiftool_tags(path, EXIFTOOL_TAGS)
     if not tags:
         return {}
     iso = compact_badge(tags.get("ISO"))
@@ -624,21 +698,25 @@ def extract_exiftool_metadata(path: Path) -> dict:
     exposure_time = exiftool_float(tags.get("ExposureTime"))
     focal_length = exiftool_float(tags.get("FocalLength"))
     exposure_bias = exiftool_float(tags.get("ExposureCompensation"))
-    return {
+    metadata = {
         "iso": f"ISO {iso}" if iso is not None else None,
         "aperture": f"f/{aperture:.1f}".replace(".0", "") if aperture else None,
         "shutter": format_shutter(exposure_time),
         "focalLength": f"{focal_length:.0f}mm" if focal_length else None,
         "exposureCompensation": format_ev(exposure_bias),
         "capturedAt": tags.get("DateTimeOriginal") or tags.get("CreateDate"),
+        "cameraWarnings": camera_warning_flags(tags),
+        "focusPixel": parse_focus_pixel(tags.get("FocusPixel")),
     }
+    make = compact_badge(tags.get("Make")) or ""
+    if "fujifilm" in make.lower():
+        metadata["brandBadges"] = fuji_brand_badges(tags)
+    return metadata
 
 
 def extract_exif(path: Path) -> dict:
-    brand_badges = extract_brand_badges(path)
     exiftool_metadata = extract_exiftool_metadata(path)
-    if brand_badges:
-        exiftool_metadata["brandBadges"] = brand_badges
+    brand_badges = exiftool_metadata.get("brandBadges") or []
     if Image is None:
         return exiftool_metadata
     ext = path.suffix.lower()
@@ -671,30 +749,53 @@ def extract_exif(path: Path) -> dict:
     focal_length = as_float(exif_ifd.get(37386))
     exposure_bias = as_float(exif_ifd.get(37380))
 
-    return {
+    merged = {
         "iso": f"ISO {iso}" if iso is not None else None,
         "aperture": f"f/{aperture:.1f}".replace(".0", "") if aperture else None,
         "shutter": format_shutter(exposure_time),
         "focalLength": f"{focal_length:.0f}mm" if focal_length else None,
         "exposureCompensation": format_ev(exposure_bias),
         "capturedAt": exif_ifd.get(36867) or exif.get(306),
-        "brandBadges": brand_badges,
     }
+    merged.update({key: value for key, value in exiftool_metadata.items() if value not in (None, "", [])})
+    merged["brandBadges"] = brand_badges
+    return merged
 
 
-def warnings_for(focus_score: float | None, raw_path: Path | None) -> list[str]:
+def warnings_for(raw_path: Path | None) -> list[str]:
+    # focus_risk is assigned after the whole batch is scanned (relative threshold)
     warnings: list[str] = []
-    if focus_score is not None and focus_score < FOCUS_RISK_THRESHOLD:
-        warnings.append("focus_risk")
     if raw_path is None:
         warnings.append("no_raw_pair")
     return warnings
 
 
+def apply_focus_risk_flags(db: sqlite3.Connection) -> float:
+    """Flag photos whose score is a low outlier within the scanned batch."""
+    rows = db.execute("SELECT id, blur_score, warnings FROM photos").fetchall()
+    scores = [row["blur_score"] for row in rows if row["blur_score"] is not None]
+    threshold = FOCUS_ABS_FLOOR
+    if len(scores) >= 5:
+        med = statistics.median(scores)
+        sigma = 1.4826 * statistics.median([abs(s - med) for s in scores])
+        threshold = max(FOCUS_ABS_FLOOR, min(med - FOCUS_MAD_MULTIPLIER * sigma, FOCUS_SOFT_CAP))
+    for row in rows:
+        warnings = [w for w in json.loads(row["warnings"] or "[]") if w != "focus_risk"]
+        if row["blur_score"] is not None and row["blur_score"] < threshold:
+            warnings.append("focus_risk")
+        db.execute("UPDATE photos SET warnings = ? WHERE id = ?", (json.dumps(warnings), row["id"]))
+    return threshold
+
+
 def process_photo(path: Path, raw_path: Path | None) -> dict:
     pid = photo_id(path)
     thumb = ensure_thumbnail(path, pid)
-    focus = estimate_focus_score(thumb)
+    metadata = extract_exif(path)
+    focus_pixel = metadata.get("focusPixel")
+    focus = analyze_focus(path, tuple(focus_pixel) if focus_pixel else None)
+    if focus is not None:
+        metadata["sharpMax"] = focus["sharpMax"]
+        metadata["sharpFocus"] = focus["sharpFocus"]
     width = None
     height = None
     if thumb and Image is not None:
@@ -704,7 +805,7 @@ def process_photo(path: Path, raw_path: Path | None) -> dict:
         except Exception:
             pass
     created_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(path.stat().st_mtime))
-    warnings = warnings_for(focus, raw_path)
+    warnings = warnings_for(raw_path)
     return {
         "id": pid,
         "path": str(path),
@@ -715,8 +816,8 @@ def process_photo(path: Path, raw_path: Path | None) -> dict:
         "width": width,
         "height": height,
         "created_at": created_at,
-        "blur_score": focus,
-        "metadata_json": json.dumps(extract_exif(path)),
+        "blur_score": focus["score"] if focus is not None else None,
+        "metadata_json": json.dumps(metadata),
         "warnings": json.dumps(warnings),
         "updated_at": time.time(),
     }
@@ -817,6 +918,9 @@ def scan_library(library: Path, workers: int = DEFAULT_WORKERS) -> dict:
                     update_scan_job(done=index, message="Processing")
                 wait_for_scan_resume()
                 submit_next()
+    db.commit()
+    update_scan_job(done=len(display_files), message="Flagging focus risk")
+    apply_focus_risk_flags(db)
     db.commit()
     for raw_path in orphan_raws:
         stat = raw_path.stat()

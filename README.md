@@ -37,7 +37,13 @@ http://127.0.0.1:8765
 - Pairs each display image with matching RAW files by stem (`.raf`, `.arw`, `.cr2`, `.cr3`, `.nef`, `.dng`, `.rw2`, `.orf`).
 - Detects orphan RAW files that do not have matching display images.
 - Generates JPEG thumbnails with macOS `sips`.
-- Estimates a 0-100 focus score from the sharpest local image regions.
+- Estimates a 0-100 focus score at native resolution: samples a 3x3 grid of
+  tiles plus the camera's AF-point tile (when EXIF provides it, e.g. Fujifilm
+  `FocusPixel`), measures gradient loss under re-blur along four directions,
+  and combines the AF-point and sharpest-tile scores. Photos whose score is a
+  low outlier within the scanned batch are flagged `focus risk`.
+- Reads camera warning tags (Fujifilm focus / blur / exposure warnings) and
+  shows them as badges alongside the algorithmic score.
 - Reads common EXIF fields for the viewer.
 - Shows camera-brand-specific badges when `exiftool` is installed.
 - Stores culling state in SQLite.

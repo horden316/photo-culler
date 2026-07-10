@@ -193,6 +193,11 @@ main {
   color: #226d58;
 }
 
+.cameraWarning {
+  background: #f4e3d7;
+  color: #a05a2c;
+}
+
 .brandBadges {
   display: flex;
   flex: 0 1 auto;

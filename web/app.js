@@ -83,8 +83,20 @@ const WARNING_LABELS = {
   no_raw_pair: "no RAW pair",
 };
 
+const CAMERA_WARNING_LABELS = {
+  camera_focus: "cam: out of focus",
+  camera_blur: "cam: blur warning",
+  camera_exposure: "cam: exposure",
+};
+
 function formatWarning(warning) {
   return WARNING_LABELS[warning] || warning.replaceAll("_", " ");
+}
+
+function renderCameraWarnings(metadata = {}) {
+  return (metadata.cameraWarnings || [])
+    .map((warning) => `<span class="badge cameraWarning">${escapeHtml(CAMERA_WARNING_LABELS[warning] || warning)}</span>`)
+    .join("");
 }
 
 function setLibrary(path) {
@@ -277,7 +289,7 @@ function renderBrandBadges(metadata = {}) {
 }
 
 function syncViewerBrandBadges(metadata = {}) {
-  viewerBrandBadges.innerHTML = renderBrandBadges(metadata);
+  viewerBrandBadges.innerHTML = renderBrandBadges(metadata) + renderCameraWarnings(metadata);
 }
 
 async function loadExposureInfo(photo) {
@@ -326,6 +338,7 @@ function renderCard(photo, index) {
       </div>
       <div class="badges">
         ${renderBrandBadges(photo.metadata)}
+        ${renderCameraWarnings(photo.metadata)}
         ${photo.warnings.map((warning) => `<span class="badge">${formatWarning(warning)}</span>`).join("")}
       </div>
       <div class="mark">
@@ -435,7 +448,12 @@ async function mark(id, status) {
 }
 
 function syncViewerStatus(photo) {
-  viewerMeta.textContent = `Focus ${formatScore(focusScore(photo))} · ${photo.rawPath ? "RAW paired" : "no RAW pair"}`;
+  const metadata = photo.metadata || {};
+  const focusDetail =
+    metadata.sharpFocus != null || metadata.sharpMax != null
+      ? ` (AF point ${formatScore(metadata.sharpFocus)} · peak ${formatScore(metadata.sharpMax)})`
+      : "";
+  viewerMeta.textContent = `Focus ${formatScore(focusScore(photo))}${focusDetail} · ${photo.rawPath ? "RAW paired" : "no RAW pair"}`;
   document.querySelectorAll("[data-mark]").forEach((button) => {
     const isSelected = button.dataset.mark === photo.status;
     button.classList.toggle("selected", isSelected);
