@@ -12,6 +12,11 @@ Grab the latest build for your platform from the [Releases](../../releases) page
 - **Windows**: `PhotoCuller-windows.zip` — unzip and run `PhotoCuller\PhotoCuller.exe`.
   If SmartScreen warns, click **More info** → **Run anyway**.
   Requires the WebView2 runtime (preinstalled on Windows 10/11).
+  If the app fails to start with a `Python.Runtime.dll` error, the extracted
+  files are still marked as downloaded from the internet — right-click the zip
+  → Properties → **Unblock** before extracting, or run
+  `Get-ChildItem <app folder> -Recurse | Unblock-File` in PowerShell.
+  (The app also clears this mark itself on startup, so this should be rare.)
 - **Linux**: `PhotoCuller-linux.tar.gz` — extract and run `PhotoCuller/PhotoCuller`.
   Requires GTK and WebKitGTK, e.g. on Ubuntu/Debian:
   `sudo apt install gir1.2-webkit2-4.1`.
