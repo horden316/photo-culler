@@ -20,6 +20,11 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 try:
+    from _version import VERSION
+except Exception:  # pragma: no cover
+    VERSION = "dev"
+
+try:
     from PIL import Image, ImageOps
 except Exception:  # pragma: no cover
     Image = None
@@ -1385,6 +1390,7 @@ class Handler(SimpleHTTPRequestHandler):
                     "librarySelected": self.library_selected,
                     "workers": self.workers,
                     "db": str(DB_PATH),
+                    "version": VERSION,
                 },
             )
             return

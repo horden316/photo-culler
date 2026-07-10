@@ -5,6 +5,7 @@ data/
 build/
 dist/
 vendor/
+app/_version.py
 
 # Python
 __pycache__/
