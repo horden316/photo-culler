@@ -384,6 +384,10 @@ function render(append = false) {
 }
 
 async function loadPhotos({ reset = false } = {}) {
+  if (!state.librarySelected) {
+    showChooseFolderPrompt();
+    return;
+  }
   if (reset) {
     state.offset = 0;
     state.photos = [];
@@ -575,6 +579,10 @@ useFolderBtn.addEventListener("click", async () => {
 });
 
 document.querySelector("#moveBtn").addEventListener("click", async () => {
+  if (!state.librarySelected) {
+    showChooseFolderPrompt();
+    return;
+  }
   const payload = await api("/api/photos?status=reject&limit=1");
   const count = payload.count || 0;
   const ok = confirm(`Move ${count} rejected photo${count === 1 ? "" : "s"} and paired RAW files into _PHOTO_CULLER_REJECTED?`);
@@ -585,6 +593,10 @@ document.querySelector("#moveBtn").addEventListener("click", async () => {
 });
 
 document.querySelector("#moveOrphanBtn").addEventListener("click", async () => {
+  if (!state.librarySelected) {
+    showChooseFolderPrompt();
+    return;
+  }
   const payload = await api("/api/orphan-raws?limit=1");
   const count = payload.count || 0;
   const ok = confirm(`Move ${count} orphan RAW file${count === 1 ? "" : "s"} into _PHOTO_CULLER_ORPHAN_RAW?`);

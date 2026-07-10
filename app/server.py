@@ -1185,6 +1185,12 @@ class Handler(SimpleHTTPRequestHandler):
     library_selected: bool = False
     workers: int = DEFAULT_WORKERS
 
+    def end_headers(self):
+        path = urlparse(self.path).path
+        if not path.startswith(("/thumbs/", "/full/", "/preview/", "/api/")):
+            self.send_header("Cache-Control", "no-cache")
+        super().end_headers()
+
     def translate_path(self, path):
         parsed = urlparse(path)
         if parsed.path.startswith("/thumbs/"):
@@ -1203,12 +1209,18 @@ class Handler(SimpleHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         if parsed.path == "/api/photos":
+            if not self.library_selected:
+                json_response(self, {"photos": [], "count": 0, "stats": {}})
+                return
             try:
                 json_response(self, list_photos(parse_qs(parsed.query)))
             except Exception as exc:
                 json_response(self, {"error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return
         if parsed.path == "/api/orphan-raws":
+            if not self.library_selected:
+                json_response(self, {"orphanRaws": [], "count": 0})
+                return
             try:
                 json_response(self, list_orphan_raws(parse_qs(parsed.query)))
             except Exception as exc:
@@ -1290,9 +1302,15 @@ class Handler(SimpleHTTPRequestHandler):
                 json_response(self, mark_photo(pid, payload.get("status", "unmarked")))
                 return
             if parsed.path == "/api/move-rejected":
+                if not self.library_selected:
+                    json_response(self, {"error": "No library selected"}, HTTPStatus.BAD_REQUEST)
+                    return
                 json_response(self, move_rejected(self.library))
                 return
             if parsed.path == "/api/move-orphan-raws":
+                if not self.library_selected:
+                    json_response(self, {"error": "No library selected"}, HTTPStatus.BAD_REQUEST)
+                    return
                 json_response(self, move_orphan_raws(self.library))
                 return
             json_response(self, {"error": "Not found"}, HTTPStatus.NOT_FOUND)
