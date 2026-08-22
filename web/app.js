@@ -14,6 +14,8 @@ const state = {
   librarySelected: false,
   browsePath: "",
   browseParent: null,
+  pending: 0,
+  analyze: true,
 };
 
 const grid = document.querySelector("#grid");
@@ -21,7 +23,10 @@ const summary = document.querySelector("#summary");
 const loadMore = document.querySelector("#loadMore");
 const viewer = document.querySelector("#viewer");
 const imageStage = document.querySelector("#imageStage");
-const viewerImg = document.querySelector("#viewerImg");
+// The photo on screen is whichever mounted layer is currently opaque. Layers
+// are created per photo rather than reused, because switching cost is
+// rasterisation, not decoding — see mountPhoto.
+let viewerImg = null;
 const viewerName = document.querySelector("#viewerName");
 const viewerPosition = document.querySelector("#viewerPosition");
 const viewerMeta = document.querySelector("#viewerMeta");
@@ -29,6 +34,7 @@ const viewerExposure = document.querySelector("#viewerExposure");
 const viewerBrandBadges = document.querySelector("#viewerBrandBadges");
 const viewerSource = document.querySelector("#viewerSource");
 const scanBtn = document.querySelector("#scanBtn");
+const analyzeBtn = document.querySelector("#analyzeBtn");
 const scanControlBtn = document.querySelector("#scanControlBtn");
 const chooseFolderBtn = document.querySelector("#chooseFolderBtn");
 const folderDialog = document.querySelector("#folderDialog");
@@ -37,6 +43,7 @@ const folderList = document.querySelector("#folderList");
 const folderShortcuts = document.querySelector("#folderShortcuts");
 const folderUpBtn = document.querySelector("#folderUpBtn");
 const useFolderBtn = document.querySelector("#useFolderBtn");
+const browseFolderBtn = document.querySelector("#browseFolderBtn");
 const zoomState = {
   scale: 1,
   x: 0,
@@ -100,6 +107,12 @@ function renderCameraWarnings(metadata = {}) {
 }
 
 function setLibrary(path) {
+  if (path !== state.library) {
+    state.photos = [];
+    state.photoCount = 0;
+    state.offset = 0;
+    grid.replaceChildren();
+  }
   state.library = path;
   state.librarySelected = true;
   document.querySelector("#libraryPath").textContent = path;
@@ -154,7 +167,7 @@ async function loadFolder(path = state.library) {
 }
 
 function applyZoom() {
-  if (zoomState.frame) return;
+  if (!viewerImg || zoomState.frame) return;
   zoomState.frame = requestAnimationFrame(() => {
     zoomState.frame = 0;
     clampPan();
@@ -163,6 +176,7 @@ function applyZoom() {
 }
 
 function applyZoomNow() {
+  if (!viewerImg) return;
   if (zoomState.frame) {
     cancelAnimationFrame(zoomState.frame);
     zoomState.frame = 0;
@@ -172,6 +186,7 @@ function applyZoomNow() {
 }
 
 function clampPan() {
+  if (!viewerImg) return;
   const rect = imageStage.getBoundingClientRect();
   const width = viewerImg.naturalWidth * zoomState.scale;
   const height = viewerImg.naturalHeight * zoomState.scale;
@@ -181,29 +196,6 @@ function clampPan() {
   const maxY = Math.max(0, (height - rect.height) / 2);
   zoomState.x = Math.min(Math.max(zoomState.x, -maxX), maxX);
   zoomState.y = Math.min(Math.max(zoomState.y, -maxY), maxY);
-}
-
-function prewarmZoomLayer() {
-  if (zoomState.prewarmFrame) {
-    cancelAnimationFrame(zoomState.prewarmFrame);
-    zoomState.prewarmFrame = 0;
-  }
-  const originalScale = zoomState.scale;
-  const originalX = zoomState.x;
-  const originalY = zoomState.y;
-  zoomState.prewarmFrame = requestAnimationFrame(() => {
-    zoomState.scale = originalScale * 1.015;
-    applyZoomNow();
-    viewerImg.getBoundingClientRect();
-    zoomState.prewarmFrame = requestAnimationFrame(() => {
-      zoomState.scale = originalScale;
-      zoomState.x = originalX;
-      zoomState.y = originalY;
-      applyZoomNow();
-      viewerImg.getBoundingClientRect();
-      zoomState.prewarmFrame = 0;
-    });
-  });
 }
 
 function panBy(deltaX, deltaY) {
@@ -238,17 +230,11 @@ function resetWheelZoomGesture() {
 }
 
 function fitZoom() {
+  if (!viewerImg) return;
   const rect = imageStage.getBoundingClientRect();
   const fit = Math.min(rect.width / viewerImg.naturalWidth, rect.height / viewerImg.naturalHeight, 1);
   zoomState.fitScale = Number.isFinite(fit) && fit > 0 ? fit : 1;
   zoomState.scale = zoomState.fitScale;
-  zoomState.x = 0;
-  zoomState.y = 0;
-  applyZoomNow();
-}
-
-function actualSizeZoom() {
-  zoomState.scale = 1;
   zoomState.x = 0;
   zoomState.y = 0;
   applyZoomNow();
@@ -307,18 +293,150 @@ async function loadExposureInfo(photo) {
   }
 }
 
+// Switching photos costs rasterisation, not decoding: handing a loaded image
+// to the visible element still spends ~350ms in Safari painting a 26MP frame,
+// and pre-decoding does not help because that work happens at paint time.
+// So each photo gets its own layer, mounted in the stage at its final scale
+// while still transparent — the browser rasterises it there, ahead of time,
+// and switching is then a change of opacity. Measured in Safari on 26MP
+// originals: 33ms a photo against 380ms for swapping a source.
+//
+// WebKit (Safari, and the WKWebView the desktop build runs in) decodes HEIF,
+// so it shows the untouched original throughout and never needs a cached
+// render. Chromium cannot decode HEIF at all and falls back, once per
+// session, to the bounded render the server produces.
+let originalsDecodable = true;
+
+// Photos held either side of the current one. Each mounted 26MP frame is
+// ~100MB of bitmap, so this window stays small.
+const MOUNT_RADIUS = 1;
+// How long the outgoing photo stays up while an unmounted one is still
+// rasterising — long enough to cover a ready neighbour, short enough that a
+// cold one still feels like the keypress registered.
+const BLANK_AFTER = 120;
+
+const layerMask = document.querySelector("#layerMask");
+const mountedLayers = new Map();
+let pendingPhotoId = null;
+let blankTimer = 0;
+
+function viewerSourceFor(photo) {
+  return originalsDecodable ? photo.originalUrl : photo.displayUrl;
+}
+
+function sourceLabel(photo) {
+  // Fixed for the whole session, so it never changes under you mid-photo, but
+  // still honest about which you are looking at: the untouched original, or
+  // the bounded render an engine that cannot decode it has to settle for.
+  if (!originalsDecodable) return "JPEG 2560px";
+  return (photo.filename.split(".").pop() || "Photo").toUpperCase();
+}
+
+function frameLayer(image) {
+  const rect = imageStage.getBoundingClientRect();
+  const fit = Math.min(rect.width / image.naturalWidth, rect.height / image.naturalHeight, 1);
+  const fitScale = Number.isFinite(fit) && fit > 0 ? fit : 1;
+  image.dataset.fitScale = String(fitScale);
+  image.style.transform = `translate3d(-50%, -50%, 0) scale(${fitScale})`;
+}
+
+function mountPhoto(photo) {
+  const existing = mountedLayers.get(photo.id);
+  if (existing) return existing;
+  const image = new Image();
+  image.className = "viewerLayer";
+  image.decoding = "async";
+  image.alt = "";
+  image.addEventListener("load", () => {
+    image.dataset.ready = "1";
+    // Framing it here is what triggers the rasterisation we want done early.
+    frameLayer(image);
+    if (pendingPhotoId === photo.id) revealPhoto(photo);
+  }, { once: true });
+  image.addEventListener("error", () => {
+    unmountPhoto(photo.id);
+    if (originalsDecodable && viewerSourceFor(photo) === photo.originalUrl) {
+      // This engine cannot decode the originals; every photo from here on
+      // comes from the server's render instead.
+      originalsDecodable = false;
+      mountedLayers.forEach((_, id) => unmountPhoto(id));
+      if (pendingPhotoId === photo.id) mountPhoto(photo);
+      return;
+    }
+    if (pendingPhotoId === photo.id) setViewerSource("Load failed", "preview");
+  }, { once: true });
+  // Below the mask, where it is painted — and so rasterised — but nothing of
+  // it reaches the screen.
+  imageStage.insertBefore(image, layerMask);
+  image.src = viewerSourceFor(photo);
+  mountedLayers.set(photo.id, image);
+  return image;
+}
+
+function unmountPhoto(id) {
+  const image = mountedLayers.get(id);
+  if (!image) return;
+  mountedLayers.delete(id);
+  image.remove();
+  // Drops the decoded bitmap rather than leaving ~100MB of it around.
+  image.removeAttribute("src");
+  if (viewerImg === image) viewerImg = null;
+}
+
+function revealPhoto(photo) {
+  const image = mountedLayers.get(photo.id);
+  if (!image || image.dataset.ready !== "1") return false;
+  clearTimeout(blankTimer);
+  // The photo being shown moves above the mask; the one leaving drops back
+  // below it. Only ever one layer is on the visible side, so no part of the
+  // screen — neither the photo nor the margin around it — composites a pixel
+  // of any other photo.
+  if (viewerImg && viewerImg !== image) {
+    viewerImg.style.opacity = "";
+    imageStage.insertBefore(viewerImg, layerMask);
+  }
+  imageStage.appendChild(image);
+  image.style.opacity = "1";
+  viewerImg = image;
+  zoomState.fitScale = Number(image.dataset.fitScale) || 1;
+  zoomState.scale = zoomState.fitScale;
+  zoomState.x = 0;
+  zoomState.y = 0;
+  applyZoomNow();
+  setViewerSource(sourceLabel(photo), "original");
+  return true;
+}
+
 function loadViewerImage(photo) {
   zoomState.loadToken += 1;
-  viewerImg.dataset.loadToken = String(zoomState.loadToken);
-  actualSizeZoom();
-  viewerImg.style.opacity = "0.001";
-  viewerImg.decoding = "async";
-  viewerImg.removeAttribute("src");
-  viewerImg.dataset.fallbackUrl = photo.fullUrl;
-  viewerImg.dataset.usingFallback = "false";
-  setViewerSource("Loading original", "original");
-  requestAnimationFrame(() => {
-    viewerImg.src = photo.originalUrl;
+  const token = zoomState.loadToken;
+  pendingPhotoId = photo.id;
+  mountPhoto(photo);
+  if (!revealPhoto(photo)) {
+    setViewerSource(sourceLabel(photo), "original");
+    clearTimeout(blankTimer);
+    blankTimer = setTimeout(() => {
+      if (token !== zoomState.loadToken) return;
+      // Clear rather than hold the previous photo: the marking keys already
+      // apply to the new one, so leaving the old image up invites marking a
+      // photo you are not looking at.
+      if (viewerImg) viewerImg.style.opacity = "0.001";
+      setViewerSource(`Loading ${sourceLabel(photo)}`, "preview");
+    }, BLANK_AFTER);
+  }
+  mountNeighbours();
+}
+
+function mountNeighbours() {
+  const keep = new Set();
+  for (let step = -MOUNT_RADIUS; step <= MOUNT_RADIUS; step += 1) {
+    const photo = state.photos[state.selectedIndex + step];
+    if (!photo) continue;
+    keep.add(photo.id);
+    mountPhoto(photo);
+  }
+  [...mountedLayers.keys()].forEach((id) => {
+    if (!keep.has(id)) unmountPhoto(id);
   });
 }
 
@@ -384,6 +502,37 @@ function renderOrphanRaw(raw) {
   return card;
 }
 
+function cardSignature(photo) {
+  return JSON.stringify([
+    photo.status,
+    photo.focusScore ?? photo.blurScore,
+    photo.warnings,
+    photo.metadata && photo.metadata.cameraWarnings,
+  ]);
+}
+
+function renderProgressive(photos) {
+  // Reuse the DOM node of every card whose content is unchanged. Rebuilding
+  // the grid outright once a second would make the browser refetch each
+  // thumbnail and drop the user's place while the scan is still running.
+  const cards = new Map();
+  grid.querySelectorAll(".card[data-id]").forEach((card) => cards.set(card.dataset.id, card));
+  const signatures = new Map(state.photos.map((photo) => [photo.id, cardSignature(photo)]));
+  const fragment = document.createDocumentFragment();
+  photos.forEach((photo, index) => {
+    const card = cards.get(photo.id);
+    const unchanged = card && signatures.get(photo.id) === cardSignature(photo) && Number(card.dataset.index) === index;
+    fragment.appendChild(unchanged ? card : renderCard(photo, index));
+  });
+  grid.replaceChildren(fragment);
+  state.photos = photos;
+}
+
+function syncAnalyzeButton() {
+  analyzeBtn.hidden = !state.librarySelected || !state.pending;
+  analyzeBtn.textContent = `Focus Scores (${state.pending})`;
+}
+
 function render(append = false) {
   if (!append) grid.innerHTML = "";
   const fragment = document.createDocumentFragment();
@@ -396,7 +545,7 @@ function render(append = false) {
   }
 }
 
-async function loadPhotos({ reset = false } = {}) {
+async function loadPhotos({ reset = false, progressive = false } = {}) {
   if (!state.librarySelected) {
     showChooseFolderPrompt();
     return;
@@ -413,18 +562,29 @@ async function loadPhotos({ reset = false } = {}) {
     return;
   }
   const params = new URLSearchParams({
-    limit: state.limit,
-    offset: state.offset,
+    // A progressive refresh has to cover everything already on screen, not
+    // just the first page, or paged-in cards would vanish mid-scan.
+    limit: progressive ? Math.min(1000, Math.max(state.limit, state.photos.length)) : state.limit,
+    offset: progressive ? 0 : state.offset,
   });
   if (state.status) params.set("status", state.status);
   if (state.warning) params.set("warning", state.warning);
   if (state.search) params.set("search", state.search);
   const payload = await api(`/api/photos?${params}`);
-  state.photos = reset ? payload.photos : payload.photos;
   state.photoCount = payload.count;
-  summary.textContent = `${payload.count} photos · keep ${payload.stats.keep || 0} · review ${payload.stats.review || 0} · reject ${payload.stats.reject || 0}`;
+  state.pending = payload.pending || 0;
+  syncAnalyzeButton();
+  if (progressive) {
+    renderProgressive(payload.photos);
+  } else {
+    state.photos = payload.photos;
+    render(false);
+  }
+  // While a scan runs the progress line owns the summary.
+  if (!progressive) {
+    summary.textContent = `${payload.count} photos · keep ${payload.stats.keep || 0} · review ${payload.stats.review || 0} · reject ${payload.stats.reject || 0}`;
+  }
   syncLoadMoreVisibility(payload.count, payload.photos.length > 0);
-  render(false);
 }
 
 async function loadOrphanRaws({ append = false } = {}) {
@@ -541,33 +701,70 @@ async function navigateViewer(delta) {
   updateViewerNavButtons();
 }
 
-async function pollScan() {
-  scanBtn.disabled = true;
-  scanControlBtn.hidden = false;
-  while (true) {
-    const job = await api("/api/scan-status");
-    const total = job.total || 0;
-    const done = job.done || 0;
-    const percent = total ? Math.round((done / total) * 100) : 0;
-    scanControlBtn.textContent = job.paused ? "Continue" : "Stop";
-    summary.textContent = job.running
-      ? `${job.paused ? "Paused" : job.message} · ${done} / ${total} · ${percent}%`
-      : job.error
-        ? `Scan failed: ${job.error}`
-        : job.result
-          ? `Scanned ${job.result.scanned} photos in ${job.result.seconds}s · paired ${job.result.paired} · focus risk ${job.result.focusRisk || 0} · orphan RAW ${job.result.orphanRaws || 0}`
-          : job.message;
-    if (!job.running) break;
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-  }
-  scanBtn.disabled = false;
-  scanControlBtn.hidden = true;
-  await loadPhotos({ reset: true });
+const STAGE_LABELS = { import: "Importing", analyze: "Focus scores" };
+
+async function fetchScanStatus() {
+  // Deliberately not via api(): a failed scan reports itself in the job's own
+  // `error` field, which api() would raise as a request failure — killing the
+  // poll loop before it could ever display the message.
+  const response = await fetch("/api/scan-status");
+  return response.json();
 }
 
-scanBtn.addEventListener("click", async () => {
+async function pollScan() {
+  scanBtn.disabled = true;
+  analyzeBtn.disabled = true;
+  scanControlBtn.hidden = false;
+  try {
+    while (true) {
+      const job = await fetchScanStatus();
+      const total = job.total || 0;
+      const done = job.done || 0;
+      const percent = total ? Math.round((done / total) * 100) : 0;
+      const stage = STAGE_LABELS[job.stage] || job.message;
+      scanControlBtn.textContent = job.paused ? "Continue" : "Stop";
+      summary.textContent = job.running
+        ? `${job.paused ? "Paused" : stage} · ${done} / ${total} · ${percent}%`
+        : job.error
+          ? `Scan failed: ${job.error}`
+          : job.result
+            ? `Scanned ${job.result.scanned} photos in ${job.result.seconds}s · paired ${job.result.paired} · focus risk ${job.result.focusRisk || 0} · orphan RAW ${job.result.orphanRaws || 0}`
+            : job.message;
+      if (!job.running) break;
+      // Show what has landed so far instead of an empty grid: on a full card
+      // the import alone runs for a while and the analysis far longer. The
+      // orphan RAW view is skipped — it is only written once the import
+      // finishes, and refreshing it would overwrite the progress line.
+      if (state.view === "photos") await loadPhotos({ progressive: true });
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+    await loadPhotos({ progressive: true });
+  } catch (error) {
+    summary.textContent = `Scan failed: ${error.message}`;
+  } finally {
+    // Always in finally: a throw mid-poll used to leave the buttons disabled
+    // with the last progress line frozen on screen, which reads as a hang.
+    scanBtn.disabled = false;
+    analyzeBtn.disabled = false;
+    scanControlBtn.hidden = true;
+  }
+}
+
+async function startScan(analyze) {
+  state.analyze = analyze;
   summary.textContent = "Starting scan...";
-  await api("/api/scan", { method: "POST", body: JSON.stringify({ library: state.library }) });
+  await api("/api/scan", {
+    method: "POST",
+    body: JSON.stringify({ library: state.library, analyze }),
+  });
+  await pollScan();
+}
+
+scanBtn.addEventListener("click", () => startScan(state.analyze));
+
+analyzeBtn.addEventListener("click", async () => {
+  summary.textContent = "Starting focus analysis...";
+  await api("/api/analyze", { method: "POST" });
   await pollScan();
 });
 
@@ -587,14 +784,17 @@ folderUpBtn.addEventListener("click", async () => {
   await loadFolder(state.browseParent);
 });
 
-useFolderBtn.addEventListener("click", async () => {
+async function useFolder(analyze) {
   if (!state.browsePath) return;
   setLibrary(state.browsePath);
   folderDialog.close();
-  summary.textContent = "Starting scan...";
-  await api("/api/scan", { method: "POST", body: JSON.stringify({ library: state.library }) });
-  await pollScan();
-});
+  await startScan(analyze);
+}
+
+// Two entry points rather than one: on an SD card the import is seconds and
+// the focus analysis is minutes, so which of the two you want is a choice.
+useFolderBtn.addEventListener("click", () => useFolder(true));
+browseFolderBtn.addEventListener("click", () => useFolder(false));
 
 document.querySelector("#moveBtn").addEventListener("click", async () => {
   if (!state.librarySelected) {
@@ -714,41 +914,7 @@ viewer.addEventListener("pointercancel", () => {
   viewerDismissPointer.target = null;
 });
 
-viewerImg.addEventListener("load", async () => {
-  const token = viewerImg.dataset.loadToken;
-  try {
-    if (viewerImg.decode) {
-      await viewerImg.decode();
-    }
-  } catch {
-    // Some Safari HEIF paths reject decode() even when the image is displayable.
-  }
-  if (token !== viewerImg.dataset.loadToken) return;
-  requestAnimationFrame(() => {
-    fitZoom();
-    requestAnimationFrame(() => {
-      viewerImg.style.opacity = "1";
-    });
-  });
-  if (viewerImg.dataset.usingFallback === "true") {
-    setViewerSource("JPEG Preview", "preview");
-    return;
-  }
-  const filename = state.selected?.filename || "";
-  const ext = filename.split(".").pop()?.toUpperCase() || "Original";
-  setViewerSource(`Original ${ext}`, "original");
-});
 
-viewerImg.addEventListener("error", () => {
-  if (viewerImg.dataset.usingFallback === "true") {
-    setViewerSource("Preview failed", "preview");
-    return;
-  }
-  viewerImg.dataset.usingFallback = "true";
-  viewerImg.dataset.loadToken = String(++zoomState.loadToken);
-  setViewerSource("JPEG Preview", "preview");
-  viewerImg.src = viewerImg.dataset.fallbackUrl;
-});
 
 imageStage.addEventListener(
   "wheel",
@@ -864,7 +1030,7 @@ async function init() {
     showChooseFolderPrompt();
     return;
   }
-  const job = await api("/api/scan-status");
+  const job = await fetchScanStatus();
   if (job.running) {
     await pollScan();
     return;

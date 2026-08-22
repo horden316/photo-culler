@@ -15,6 +15,7 @@
       <div class="actions">
         <button id="chooseFolderBtn">Choose Folder</button>
         <button id="scanBtn">Scan</button>
+        <button id="analyzeBtn" hidden>Focus Scores</button>
         <button id="scanControlBtn" hidden>Stop</button>
         <button id="moveOrphanBtn">Move Orphan RAWs</button>
         <button id="moveBtn" class="danger">Move Rejects</button>
@@ -44,7 +45,7 @@
         <button class="close">Close</button>
       </form>
       <div class="imageStage" id="imageStage">
-        <img id="viewerImg" alt="" />
+        <div class="layerMask" id="layerMask"></div>
       </div>
       <div class="viewerInfo">
         <div class="viewerTitle">
@@ -82,12 +83,13 @@
         <div id="folderShortcuts" class="folderShortcuts"></div>
         <div class="folderToolbar">
           <button id="folderUpBtn" type="button">Up</button>
-          <button id="useFolderBtn" type="button">Use This Folder</button>
+          <button id="browseFolderBtn" type="button">Browse Only</button>
+          <button id="useFolderBtn" type="button">Browse + Focus Scores</button>
         </div>
         <div id="folderList" class="folderList"></div>
       </div>
     </dialog>
 
-    <script src="/app.js?v=library-guard"></script>
+    <script src="/app.js?v=layer-mask"></script>
   </body>
 </html>

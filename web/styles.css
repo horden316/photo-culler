@@ -352,7 +352,7 @@ dialog::backdrop {
   cursor: grabbing;
 }
 
-#viewerImg {
+.viewerLayer {
   backface-visibility: hidden;
   display: block;
   left: 50%;
@@ -364,6 +364,21 @@ dialog::backdrop {
   user-select: none;
   will-change: transform;
   -webkit-user-drag: none;
+}
+
+/* Layers waiting their turn have to be painted to stay rasterised — at
+   opacity 0, or parked outside the stage, WebKit skips them and a switch
+   costs 367ms instead of 33ms. They sit under an opaque mask the colour of
+   the stage, so nothing of them reaches the screen; the near-zero opacity is
+   only a second line of defence if that mask ever fails to cover. */
+.viewerLayer {
+  opacity: 0.0001;
+}
+
+.layerMask {
+  background: #111111;
+  inset: 0;
+  position: absolute;
 }
 
 .viewerInfo {
